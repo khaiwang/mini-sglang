@@ -27,7 +27,19 @@ pytest                              # run all tests (requires GPU)
 pytest tests/kernel/test_tensor.py  # run a single test file
 ```
 
-Tests are in `tests/` organized by subsystem: `core/`, `kernel/`, `misc/`. Some tests (e.g., `test_scheduler.py`) spawn subprocesses and require a GPU with a real model. Tests use `call_if_main` decorator pattern — they can also be run directly as scripts.
+Tests are in `tests/` organized by subsystem: `core/`, `kernel/`, `misc/`, `intervention/`. Some tests (e.g., `test_scheduler.py`) spawn subprocesses and require a GPU with a real model. Tests use `call_if_main` decorator pattern — they can also be run directly as scripts.
+
+### Environment Setup
+
+Use conda (no `uv` on this machine):
+```bash
+conda create -n minisgl python=3.12 -y
+conda run -n minisgl pip install -e ".[dev]"
+conda run -n minisgl pytest tests/              # run tests
+conda run -n minisgl ruff check .               # lint
+```
+
+Git remote uses SSH (`git@github.com:khaiwang/mini-sglang.git`).
 
 ### Linting / Formatting
 ```bash
