@@ -1,0 +1,418 @@
+# Buffer+Mask Intervention System — Roadmap
+
+## Goal
+
+Build an activation intervention system for mini-sglang that supports observe (read), steer/ablate (write), and conditional (read-then-write) interventions — unified across prefill and decode, compatible with CUDA graphs, with zero control flow in the hot path.
+
+## Core Design
+
+### Two Fixed Ops Per Layer
+
+After each transformer layer's `forward()`, two tensor ops execute unconditionally:
+
+```python
+# 1. Observe: write activations into observation buffer
+#    Prefill (eager): slice assignment into ring buffer, one layer at a time
+observe_prefill(x, layer_idx, ring_buf, obs_mask, req_map, write_offset)
+#    Decode (CUDA graph): index_copy_ into flat buffer with pre-computed offsets
+observe_decode(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets)
+
+# 2. Blend: apply per-request intervention masks (same for prefill and decode)
+x = x * scale[layer_idx, req_map] + add[layer_idx, req_map]  # [total_tokens, hidden_dim]
+```
+
+Both ops:
+- **Always execute** — no branches, no conditionals, no hooks
+- **Blend is captured in CUDA graphs** (decode) or runs eagerly (prefill). **Observe has separate implementations**: `observe_prefill` (eager, ring buffer) and `observe_decode` (CUDA-graph-safe, flat buffer with `index_copy_`).
+- **CUDA graphs are only used for decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly, even with chunked prefill. This means prefill and decode can use different observation strategies.
+- **Reduce to no-ops via data**: `obs_mask=0` skips observation, `scale=1/add=0` is identity blend
+- **Support per-request, per-layer granularity** via `req_map` gather
+
+### Unified Prefill + Decode via `req_map`
+
+`req_map: [total_tokens] → table_idx` maps each token in the flattened batch to its owning request's stable slot.
+
+| Phase | `x` shape | `req_map` | Notes |
+|-------|-----------|-----------|-------|
+| Prefill | `[total_tokens, hidden]` | `[tok0→R0, tok1→R0, ..., tokN→R1, ...]` | Multiple tokens per request |
+| Decode | `[batch_size, hidden]` | `[table_idx_0, table_idx_1, ...]` | One token per request |
+| Chunked prefill | Same as prefill | Same | `total_tokens ≤ max_extend_tokens` guaranteed |
+
+All mask/observation tensors are indexed by `(layer, table_idx)`. The gather `mask[layer, req_map]` fans out per-request values to per-token automatically. Requests in the same batch with different intervention targets (e.g., request A observes layer 5, request B observes layer 12) coexist without branching — the per-request masks encode the difference.
+
+### `req_map` Plumbing
+
+`req_map` is already computed in `_make_input_tuple()` (`scheduler.py:254-261`) as the `table_idx` mapping. To make it available inside `model.forward()`:
+
+1. Add `req_map: torch.Tensor` field to `Batch` (`core.py`)
+2. Set it in `Scheduler._prepare_batch()` from `_make_input_tuple()`
+3. Access via `get_global_ctx().batch.req_map` in intervention ops
+4. Add to `GraphCaptureBuffer` (`graph.py`), copied in `copy_from()` like `input_ids`
+
+### Observation Granularity
+
+Any observation pattern is expressible via the `obs_mask[layer, table_idx]` tensor:
+
+- **All tokens for request R at layer L**: `obs_mask[L, R] = 1.0`, all other entries 0
+- **Last token only**: set `obs_mask` such that only the last token position accumulates (via a separate position-aware index, or post-process from full observation)
+- **Specific position P**: use a position-filtered index tensor
+- **Bulk harvest** (à la Goodfire): `obs_mask[:, :] = 1.0` for all layers, all requests
+
+### Performance Characteristics
+
+**No existing fusions are broken.** Each transformer layer is already a sequence of discrete kernel calls (fused_norm → attention → fused_norm → MLP). The intervention ops are inserted between two layers that already communicate through global memory. No cross-layer fusion exists in mini-sglang today.
+
+**Cost model for the two inserted ops per layer:**
+- Kernel launch overhead: ~5-10µs × 2 ops × `num_layers` = 320-640µs for 32 layers
+- Memory bandwidth: negligible in decode (bs × hidden_dim ≈ 8KB per op), hidden behind matmuls in prefill
+- Compute: elementwise multiply+add, negligible vs attention/MLP matmuls
+
+**CUDA graph implications:**
+- Ops at every layer (fixed topology), identity masks make them numerical no-ops
+- No graph topology change when interventions are enabled/disabled — purely data-driven
+- Extra kernels increase graph size slightly but graph capture is one-time cost
+
+**Possible optimization (future):** fuse observe+blend into a single custom kernel per layer, halving kernel launch count.
+
+## Three-Stage Async Pipeline
+
+Inspired by [Goodfire's activation harvesting architecture](https://www.goodfire.ai/blog/interpretability-infra-at-frontier-scale):
+
+**Prefill (eager):** Ring buffer streams layer-by-layer. After each layer writes into the ring,
+a dedicated CUDA copy stream asynchronously drains the region to CPU pinned memory. Ring space
+is reclaimed as copies complete, allowing reuse without pre-allocating per-layer buffers.
+
+```
+Stage 1 (GPU, per layer)          Stage 2 (async, per layer)       Stage 3 (CPU, overlapped)
+─────────────────────────────     ─────────────────────────        ──────────────────────────
+observe_prefill() writes          Ring buffer's copy stream         InterventionManager.step()
+masked activations into ring      async copies region to CPU        reads observations via
+at write_ptr. No allocation.      pinned staging. Ring space        poll()/flush(), runs
+                                  freed for reuse.                  handlers, updates masks.
+```
+
+**Decode (CUDA graph):** Uses a separate small flat buffer with pre-computed layer offsets.
+`observe_decode()` uses `index_copy_` with GPU tensor indices (CUDA-graph safe). Bulk-copied
+to CPU after graph replay.
+
+```
+Stage 1 (GPU, in graph)           Stage 2 (after replay)           Stage 3 (CPU, overlapped)
+─────────────────────────────     ─────────────────────────        ──────────────────────────
+observe_decode() index_copy_      copy_to_cpu() bulk copies         Same as prefill stage 3.
+into flat buffer at each layer.   entire flat buffer to CPU.
+Pre-computed offsets, graph-safe. Non-blocking.
+```
+
+## Components
+
+### `intervention/buffers.py` — Pre-allocated GPU Tensors
+
+```python
+class ObservationRingBuffer:
+    # Streaming ring buffer for prefill observations (eager execution only)
+    _buf: Tensor              # [ring_size, hidden_dim] — GPU ring buffer
+    _obs_mask: Tensor         # [num_layers, max_running_req] — per-request per-layer enable
+    _write_ptr: int           # current write position (CPU-tracked)
+    _copy_stream: Stream      # dedicated CUDA stream for async D2H copies
+    _cpu_staging: Tensor      # [ring_size, hidden_dim] — pinned CPU memory
+    _pending: List[ObsEntry]  # in-flight copies: (layer_idx, offset, length, event)
+
+    def write(x, layer_idx, obs_mask, req_map) -> None: ...   # write + async copy
+    def poll() -> List[Tuple[int, Tensor]]: ...                # non-blocking check
+    def flush() -> List[Tuple[int, Tensor]]: ...               # sync all pending
+    def reset() -> None: ...
+    def available_space() -> int: ...
+
+class DecodeObservationBuffer:
+    # Flat buffer for decode observations (CUDA graph compatible)
+    _buf: Tensor              # [num_layers * max_decode_bs, hidden_dim]
+    _obs_mask: Tensor         # [num_layers, max_running_req]
+    _offsets: Tensor          # [num_layers] — pre-computed layer offsets
+    _base_indices: Tensor     # [max_decode_bs] — [0, 1, 2, ...]
+    _cpu_buf: Tensor          # pinned CPU staging
+
+    def get_write_args(layer_idx, bs) -> Tuple[Tensor, Tensor]: ...
+    def reset() -> None: ...
+    def copy_to_cpu() -> Tensor: ...
+
+class MaskBuffer:
+    # Per-request, per-layer intervention masks
+    _scale: Tensor            # [num_layers, max_running_req, hidden_dim] — default 1.0
+    _add: Tensor              # [num_layers, max_running_req, hidden_dim] — default 0.0
+
+    def reset(self) -> None: ...            # scale=1, add=0 (identity)
+    def set_ablate(self, layer, table_idx) -> None: ...
+    def set_steer(self, layer, table_idx, vector, alpha) -> None: ...
+    def set_patch(self, layer, table_idx, activation) -> None: ...
+```
+
+All attributes `_`-prefixed to hide from `BaseOP.state_dict()`.
+
+Buffer sizes: `max_obs_tokens = max_extend_tokens`, `max_running_req` from `EngineConfig`. Pre-allocated once at engine init, reused across all forward passes.
+
+### `intervention/ops.py` — Pure Tensor Functions
+
+```python
+def observe_prefill(x, layer_idx, ring_buf, obs_mask, req_map, write_offset):
+    """Write observation into ring buffer at write_offset. Eager mode only."""
+    per_token_mask = obs_mask[layer_idx, req_map]               # [total_tokens]
+    masked = x * per_token_mask.unsqueeze(-1)                   # [total_tokens, hidden_dim]
+    ring_buf[write_offset:write_offset + n] = masked
+
+def observe_decode(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets):
+    """Write observation into flat buffer using index_copy_. CUDA-graph safe."""
+    per_token_mask = obs_mask[layer_idx, req_map]
+    masked = x * per_token_mask.unsqueeze(-1)
+    indices = base_indices[:x.shape[0]] + offsets[layer_idx]
+    flat_buf.index_copy_(0, indices, masked)
+
+def mask_blend(x, layer_idx, scale, add, req_map):
+    """Apply per-request intervention. Works in both eager and graph mode."""
+    return x * scale[layer_idx, req_map] + add[layer_idx, req_map]
+```
+
+### `intervention/context.py` — Global Singleton
+
+```python
+@dataclass
+class InterventionContext:
+    obs_buffer: ObservationBuffer
+    mask_buffer: MaskBuffer
+
+_INTERVENTION_CTX: InterventionContext | None = None
+
+def get_intervention_ctx() -> InterventionContext | None:
+    """Returns None when intervention is disabled (vanilla mode)."""
+    return _INTERVENTION_CTX
+
+def set_intervention_ctx(ctx: InterventionContext) -> None: ...
+```
+
+### `intervention/manager.py` — CPU-side Async Logic
+
+```python
+class InterventionManager:
+    def __init__(self, ctx: InterventionContext): ...
+
+    def submit(self, uid: int, request: InterventionRequest) -> None:
+        """Register intervention for a request."""
+
+    def remove(self, uid: int) -> None:
+        """Cleanup when request finishes."""
+
+    def prepare_step(self) -> None:
+        """Called before forward: reset obs_buf, update routes/masks from pending requests."""
+
+    def process_step(self, obs_cpu: Tensor | None) -> None:
+        """Called after forward (in _process_last_data):
+        1. Dispatch observations to per-request handlers
+        2. Run conditional_write callbacks
+        3. Queue mask updates for next step
+        """
+```
+
+### `intervention/request.py` — User-facing API
+
+```python
+@dataclass
+class InterventionRequest:
+    uid: int
+    observations: List[ObserveOp]
+    writes: List[WriteOp]
+    conditional_writes: List[ConditionalWriteOp]
+
+    def observe(self, layer: int, positions: slice | list[int] | None = None) -> Self: ...
+    def ablate(self, layer: int) -> Self: ...                           # scale=0, add=0
+    def steer(self, layer: int, vector: Tensor, alpha: float = 1.0) -> Self: ...  # scale=1, add=alpha*v
+    def patch(self, layer: int, activation: Tensor) -> Self: ...        # scale=0, add=activation
+    def conditional_write(self, read_layer: int, write_layer: int,
+                         fn: Callable[[Tensor], Tuple[Tensor, Tensor]]) -> Self: ...
+```
+
+## Integration Points
+
+### Modified existing files
+
+| File | Change |
+|------|--------|
+| `core.py` | Add `req_map: torch.Tensor` field to `Batch` |
+| `models/llama.py` | Add intervention ops to `LlamaModel.forward()` layer loop |
+| `models/qwen2.py` | Same for `Qwen2Model.forward()` |
+| `models/qwen3.py` | Same for `Qwen3Model.forward()` |
+| `models/qwen3_moe.py` | Same for `Qwen3Model.forward()` |
+| `engine/config.py` | Add `enable_intervention: bool = False` to `EngineConfig` |
+| `engine/engine.py` | Allocate buffers in `__init__`, add obs to `ForwardOutput` |
+| `engine/graph.py` | Add `req_map` to `GraphCaptureBuffer` |
+| `scheduler/scheduler.py` | Set `batch.req_map` in `_prepare_batch()`, call manager in `_process_last_data()` |
+| `server/args.py` | Add `--enable-intervention` CLI flag |
+
+### Model forward modification (identical pattern for all models)
+
+```python
+# Before (e.g., llama.py LlamaModel.forward):
+def forward(self, input_ids):
+    x = self.embed_tokens.forward(input_ids)
+    residual = None
+    for layer in self.layers.op_list:
+        x, residual = layer.forward(x, residual)
+    return self.norm.forward(x, residual)[0]
+
+# After:
+def forward(self, input_ids):
+    x = self.embed_tokens.forward(input_ids)
+    residual = None
+    ictx = get_intervention_ctx()
+    if ictx is not None:
+        batch = get_global_ctx().batch
+        for i, layer in enumerate(self.layers.op_list):
+            x, residual = layer.forward(x, residual)
+            observe(x, i, ictx.obs_buffer.active_buf, ictx.obs_buffer._obs_mask, batch.req_map)
+            x = mask_blend(x, i, ictx.mask_buffer._scale, ictx.mask_buffer._add, batch.req_map)
+    else:
+        for layer in self.layers.op_list:
+            x, residual = layer.forward(x, residual)
+    return self.norm.forward(x, residual)[0]
+```
+
+The `if ictx is not None` is evaluated at CUDA graph capture time. Once captured, the graph permanently includes intervention ops. The `else` branch is for vanilla mode (no intervention context set at all).
+
+### New file structure
+
+```
+python/minisgl/intervention/
+├── __init__.py          # Public exports: get/set_intervention_ctx, observe, mask_blend
+├── buffers.py           # ObservationBuffer, MaskBuffer
+├── ops.py               # observe(), mask_blend() — pure tensor functions
+├── context.py           # InterventionContext singleton
+├── manager.py           # InterventionManager (CPU-side async)
+└── request.py           # InterventionRequest (user-facing API)
+
+tests/intervention/
+├── test_buffers.py      # Buffer allocation, route/mask updates, ping-pong swap
+├── test_ops.py          # Op correctness: identity, ablation, steering, multi-request
+├── test_req_map.py      # req_map plumbing: prefill packing, decode identity, graph buffer
+└── test_e2e.py          # End-to-end with real model (spawn scheduler subprocess)
+
+benchmark/intervention/
+└── bench_overhead.py    # Vanilla vs identity-mask vs active intervention throughput
+```
+
+## Implementation Steps
+
+### Step 1: Buffers + Ops (no integration yet)
+
+**Files:** `intervention/buffers.py`, `intervention/ops.py`, `tests/intervention/test_buffers.py`, `tests/intervention/test_ops.py`
+
+Build and test in isolation with mock tensors (no model, no engine):
+- `ObservationBuffer`: allocation, `reset_active()`, `swap()`, double-buffer correctness
+- `MaskBuffer`: allocation, `reset()`, `set_ablate/steer/patch`, verify tensor values
+- `observe()`: verify accumulation with various `obs_mask` patterns (single layer, multi-layer, multi-request)
+- `mask_blend()`: verify identity (scale=1, add=0), ablation (scale=0, add=0), steering (scale=1, add=v), multi-request isolation via `req_map`
+
+### Step 2: Context + `req_map` Plumbing
+
+**Files:** `intervention/context.py`, `core.py`, `engine/graph.py`, `scheduler/scheduler.py`
+
+- Add `InterventionContext` singleton with get/set
+- Add `req_map` field to `Batch` dataclass
+- Add `req_map` to `GraphCaptureBuffer` (init, `set_batch`, `copy_from`)
+- Set `batch.req_map` in `Scheduler._prepare_batch()` using table_idx from `_make_input_tuple()`
+- Test: verify `req_map` values are correct for prefill (packed multi-request) and decode (one per request)
+
+### Step 3: Model Integration
+
+**Files:** `models/llama.py`, `models/qwen2.py`, `models/qwen3.py`, `models/qwen3_moe.py`
+
+- Modify `*Model.forward()` layer loops to call `observe()` + `mask_blend()` when intervention context is set
+- Extract shared helper if possible to avoid duplicating the pattern
+- Test: with `enable_intervention=False`, verify no behavior change (intervention context not set → vanilla path)
+
+### Step 4: Engine Integration
+
+**Files:** `engine/config.py`, `engine/engine.py`, `engine/engine.py` (ForwardOutput)
+
+- Add `enable_intervention: bool = False` to `EngineConfig`
+- In `Engine.__init__`, after model load and before graph capture:
+  - Allocate `ObservationBuffer` and `MaskBuffer`
+  - Create and set `InterventionContext`
+- Add `obs_buf_cpu` to `ForwardOutput` (async-copied obs buffer from inactive ping-pong slot)
+- Add `--enable-intervention` to `server/args.py`
+- Test: engine init with intervention enabled, verify buffers allocated, graphs captured with intervention ops
+
+### Step 5: Manager + Request API
+
+**Files:** `intervention/manager.py`, `intervention/request.py`
+
+- `InterventionRequest`: builder API for `observe()`, `ablate()`, `steer()`, `patch()`, `conditional_write()`
+- `InterventionManager`:
+  - `submit(uid, request)`: register, translate request into buffer updates
+  - `remove(uid)`: cleanup masks/routes for finished request
+  - `prepare_step()`: reset obs_buf, apply pending mask updates
+  - `process_step(obs_cpu)`: dispatch observations to handlers, run conditional callbacks
+- Test with mock forward passes (no real model)
+
+### Step 6: Scheduler Integration
+
+**Files:** `scheduler/scheduler.py`
+
+- Create `InterventionManager` in `Scheduler.__init__` when intervention is enabled
+- In `_prepare_batch()`: call `manager.prepare_step()` (reset obs, update routes)
+- In `_process_last_data()`: after `copy_done.synchronize()`, call `manager.process_step(obs_cpu)`
+- Wire intervention requests from incoming `UserMsg` (or separate intervention message type)
+- Test: full scheduler loop with intervention
+
+### Step 7: End-to-End Tests
+
+**File:** `tests/intervention/test_e2e.py`
+
+Following `tests/core/test_scheduler.py` pattern (spawn subprocess, send messages, check results):
+
+1. **Identity test**: intervention enabled, default masks → output matches vanilla
+2. **Ablation test**: scale=0, add=0 at layer N → output changes, verify deterministically
+3. **Steering test**: scale=1, add=vector at layer N → output shifts
+4. **Observation test**: observe layer N → obs_buf contains correct hidden states
+5. **Multi-request isolation**: two requests, different interventions → each gets correct treatment
+6. **Prefill observation**: observe during prefill → all tokens captured correctly
+7. **Chunked prefill**: long prompt chunked → intervention applies correctly across chunks
+
+### Step 8: Benchmark
+
+**File:** `benchmark/intervention/bench_overhead.py`
+
+Three configurations, same model (Qwen3-0.6B), same workload:
+
+1. **Vanilla**: `--enable-intervention` off
+2. **Identity overhead**: intervention on, all masks identity — measures pure op overhead
+3. **Active intervention**: intervention on, observation at 4 layers + steering at 2 layers
+
+Metrics: tokens/sec (prefill + decode), per-step latency, GPU utilization.
+
+## Design Decisions Log
+
+| Decision | Rationale |
+|----------|-----------|
+| `req_map` gather instead of per-token masks | Memory-efficient (`[layers, max_req, hidden]` vs `[layers, max_tokens, hidden]`), semantically cleaner (interventions are per-request) |
+| Masks indexed by `table_idx` not batch position | Stable per-request slot, masks persist as batch composition changes |
+| `_`-prefixed buffer attributes | `BaseOP.state_dict()` skips `_`-prefixed names — buffers hidden from model checkpoints |
+| `if ictx is not None` branch at capture time | Graph topology fixed at capture. Vanilla mode (no intervention) avoids all overhead |
+| Intervene after full layer (post-MLP, post-allreduce) | Clean hidden state, TP-merged activations, no fusion broken |
+| Double-buffered obs_buf | GPU writes buffer A while CPU reads buffer B — no stalls |
+| Ops at every layer, data-driven enable | CUDA graphs require fixed topology. Per-request per-layer `obs_mask` controls which layers are active for which requests |
+
+## What This Proves
+
+- Buffer+mask ops have measurable but bounded overhead when inserted into the forward pass
+- CUDA graph capture works with intervention ops included (no hooks, no dynamic control flow)
+- Multiple concurrent requests with different intervention targets run in the same batch without interference
+- `req_map` gather unifies prefill and decode under one code path
+- Async observation pipeline overlaps with GPU compute via overlap scheduling
+
+## Future Work (Not in This Demo)
+
+- KV cache dirty page tracking / prefix cache pollution from interventions
+- `torch.compile` fusion of intervention ops with adjacent kernels
+- Real nnsight API translation layer
+- Multi-GPU tensor parallel buffer distribution (currently: intervene post-allreduce only)
+- Custom fused observe+blend kernel to halve kernel launch overhead
+- Position-specific observation (per-token mask within a request, not just per-request)
+- Streaming observation API for real-time activation visualization
