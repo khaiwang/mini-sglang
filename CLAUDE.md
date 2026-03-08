@@ -97,6 +97,31 @@ All source is under `python/minisgl/`. Key module relationships:
 
 See **[`docs/intervention_roadmap.md`](docs/intervention_roadmap.md)** for the full design and implementation plan.
 
+### nnsight Reference (`~/nnsight/`)
+
+The nnsight library (`~/nnsight/`) is the reference for intervention API design. Key docs:
+- `~/nnsight/CLAUDE.md` — comprehensive agent guide (common patterns, vLLM integration, gotchas)
+- `~/nnsight/NNsight.md` — deep design doc (tracing, interleaving, Envoy, vLLM architecture)
+- `~/nnsight/NNsight_Walkthrough.ipynb` — walkthrough notebook with examples
+
+**nnsight intervention scenarios (constrained scope for mini-sglang):**
+
+| nnsight Pattern | mini-sglang Equivalent | In Scope? |
+|----------------|----------------------|-----------|
+| `model.layers[L].output.save()` — observe activations | `observe_prefill` / `observe_decode` with `obs_mask[L]=1` | Yes |
+| `model.layers[L].output[:] = 0` — ablation | `MaskBuffer.set_ablate(L, table_idx)` (scale=0, add=0) | Yes |
+| `model.layers[L].output += vector` — steering | `MaskBuffer.set_steer(L, table_idx, vector, alpha)` | Yes |
+| `model.layers[L].output = activation` — patching | `MaskBuffer.set_patch(L, table_idx, activation)` (scale=0, add=act) | Yes |
+| Activation patching across prompts (clean→corrupt) | `conditional_write`: observe layer L from req A, patch into req B | Yes |
+| Multi-request batching with different interventions | `req_map` + per-`(layer, table_idx)` masks — different requests target different layers | Yes |
+| `.input` access (module inputs) | Out of scope — only post-layer residual stream | No |
+| `.grad` / backward pass gradients | Out of scope — inference only | No |
+| `model.edit()` — persistent model edits | Out of scope — per-request masks reset each step | No |
+| Source tracing (sub-module internals) | Out of scope — only full-layer granularity | No |
+| `tracer.stop()` — early stopping | Out of scope — all layers always execute | No |
+| Module skipping (`layer.skip()`) | Out of scope — blend can zero output but layer still runs | No |
+| Multi-token generation `.iter` steps | Implicit — decode loop runs per-token, masks persist across steps | N/A |
+
 ### Summary
 
 Two fixed tensor ops inserted after each transformer layer: **observe** (read activations) and **blend** (modify activations). Separate observation strategies for prefill vs decode:

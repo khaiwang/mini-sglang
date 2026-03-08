@@ -1,17 +1,16 @@
-"""Tests for intervention ops: observe_prefill, observe_decode, mask_blend."""
+"""Tests for intervention ops: observe, mask_blend."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from minisgl.intervention.ops import mask_blend, observe_decode, observe_prefill
+from minisgl.intervention.ops import mask_blend, observe
 
 # Small test sizes
 NUM_LAYERS = 4
 HIDDEN_DIM = 16
 MAX_RUNNING_REQ = 8
-RING_SIZE = 64
-MAX_DECODE_BS = 8
+MAX_TOKENS = 8
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -21,98 +20,17 @@ def device():
     return torch.device("cuda:0")
 
 
-# ─── observe_prefill ─────────────────────────────────────────────────────────
+# ─── observe ─────────────────────────────────────────────────────────────────
 
 
 @requires_cuda
-class TestObservePrefill:
-    def test_all_masked_out(self, device):
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
-        x = torch.randn(4, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(4, dtype=torch.long, device=device)
-
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
-        )
-        assert torch.all(ring_buf == 0)
-
-    def test_single_request(self, device):
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
-        obs_mask[0, 0] = 1.0
-        x = torch.randn(4, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(4, dtype=torch.long, device=device)
-
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
-        )
-        assert torch.allclose(ring_buf[:4], x, atol=1e-6)
-        assert torch.all(ring_buf[4:] == 0)
-
-    def test_multi_request_isolation(self, device):
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
-        obs_mask[0, 0] = 1.0  # enable req 0
-        obs_mask[0, 1] = 0.0  # disable req 1
-
-        x = torch.randn(6, HIDDEN_DIM, device=device)
-        req_map = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long, device=device)
-
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
-        )
-
-        # Req 0 tokens observed, req 1 tokens zeroed
-        assert torch.allclose(ring_buf[:3], x[:3], atol=1e-6)
-        assert torch.all(ring_buf[3:6] == 0)
-
-    def test_does_not_modify_x(self, device):
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
-        obs_mask[0, 0] = 1.0
-        x = torch.randn(4, HIDDEN_DIM, device=device)
-        x_copy = x.clone()
-        req_map = torch.zeros(4, dtype=torch.long, device=device)
-
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
-        )
-        assert torch.equal(x, x_copy)
-
-    def test_writes_at_offset(self, device):
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
-        obs_mask[0, 0] = 1.0
-        x = torch.randn(4, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(4, dtype=torch.long, device=device)
-        offset = 20
-
-        observe_prefill(
-            x,
-            layer_idx=0,
-            ring_buf=ring_buf,
-            obs_mask=obs_mask,
-            req_map=req_map,
-            write_offset=offset,
-        )
-
-        assert torch.all(ring_buf[:offset] == 0)
-        assert torch.allclose(ring_buf[offset : offset + 4], x, atol=1e-6)
-        assert torch.all(ring_buf[offset + 4 :] == 0)
-
-
-# ─── observe_decode ──────────────────────────────────────────────────────────
-
-
-@requires_cuda
-class TestObserveDecode:
+class TestObserve:
     def _make_flat_buf(self, device):
-        total = NUM_LAYERS * MAX_DECODE_BS
+        total = NUM_LAYERS * MAX_TOKENS
         flat_buf = torch.zeros(total, HIDDEN_DIM, device=device)
-        offsets = torch.arange(0, total, MAX_DECODE_BS, dtype=torch.int64, device=device)
-        base_indices = torch.arange(MAX_DECODE_BS, dtype=torch.int64, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
+        offsets = torch.arange(0, total, MAX_TOKENS, dtype=torch.int64, device=device)
+        base_indices = torch.arange(MAX_TOKENS, dtype=torch.int64, device=device)
+        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, dtype=torch.float32, device=device)
         return flat_buf, offsets, base_indices, obs_mask
 
     def test_all_masked_out(self, device):
@@ -120,7 +38,7 @@ class TestObserveDecode:
         x = torch.randn(4, HIDDEN_DIM, device=device)
         req_map = torch.zeros(4, dtype=torch.long, device=device)
 
-        observe_decode(
+        observe(
             x,
             layer_idx=0,
             flat_buf=flat_buf,
@@ -131,14 +49,32 @@ class TestObserveDecode:
         )
         assert torch.all(flat_buf == 0)
 
-    def test_single_layer(self, device):
+    def test_single_request(self, device):
+        flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
+        obs_mask[0, 0] = 1.0
+        x = torch.randn(4, HIDDEN_DIM, device=device)
+        req_map = torch.zeros(4, dtype=torch.long, device=device)
+
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
+        )
+        assert torch.allclose(flat_buf[:4], x, atol=1e-6)
+        assert torch.all(flat_buf[4:] == 0)
+
+    def test_single_layer_at_offset(self, device):
         flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
         obs_mask[1, 0] = 1.0
         bs = 3
         x = torch.randn(bs, HIDDEN_DIM, device=device)
         req_map = torch.zeros(bs, dtype=torch.long, device=device)
 
-        observe_decode(
+        observe(
             x,
             layer_idx=1,
             flat_buf=flat_buf,
@@ -148,11 +84,11 @@ class TestObserveDecode:
             offsets=offsets,
         )
 
-        # Layer 1 region starts at MAX_DECODE_BS
-        start = MAX_DECODE_BS
+        # Layer 1 region starts at MAX_TOKENS
+        start = MAX_TOKENS
         assert torch.allclose(flat_buf[start : start + bs], x, atol=1e-6)
         # Layer 0 region should be untouched
-        assert torch.all(flat_buf[:MAX_DECODE_BS] == 0)
+        assert torch.all(flat_buf[:MAX_TOKENS] == 0)
 
     def test_multi_layer(self, device):
         flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
@@ -164,7 +100,7 @@ class TestObserveDecode:
         for layer_idx in range(NUM_LAYERS):
             x = torch.randn(bs, HIDDEN_DIM, device=device)
             xs.append(x)
-            observe_decode(
+            observe(
                 x,
                 layer_idx=layer_idx,
                 flat_buf=flat_buf,
@@ -175,10 +111,33 @@ class TestObserveDecode:
             )
 
         for layer_idx in range(NUM_LAYERS):
-            start = layer_idx * MAX_DECODE_BS
+            start = layer_idx * MAX_TOKENS
             assert torch.allclose(flat_buf[start : start + bs], xs[layer_idx], atol=1e-6)
 
     def test_multi_request_isolation(self, device):
+        flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
+        obs_mask[0, 0] = 1.0  # enable req 0
+        obs_mask[0, 1] = 0.0  # disable req 1
+
+        # Prefill-style: multiple tokens per request
+        x = torch.randn(6, HIDDEN_DIM, device=device)
+        req_map = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long, device=device)
+
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
+        )
+
+        # Req 0 tokens observed, req 1 tokens zeroed
+        assert torch.allclose(flat_buf[:3], x[:3], atol=1e-6)
+        assert torch.all(flat_buf[3:6] == 0)
+
+    def test_decode_style_one_token_per_request(self, device):
         flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
         obs_mask[0, 0] = 1.0  # enable req 0
         obs_mask[0, 1] = 0.0  # disable req 1
@@ -186,7 +145,7 @@ class TestObserveDecode:
         x = torch.randn(bs, HIDDEN_DIM, device=device)
         req_map = torch.tensor([0, 1], dtype=torch.long, device=device)
 
-        observe_decode(
+        observe(
             x,
             layer_idx=0,
             flat_buf=flat_buf,
@@ -199,6 +158,24 @@ class TestObserveDecode:
         # Token 0 (req 0) observed, token 1 (req 1) zeroed
         assert torch.allclose(flat_buf[0], x[0], atol=1e-6)
         assert torch.all(flat_buf[1] == 0)
+
+    def test_does_not_modify_x(self, device):
+        flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
+        obs_mask[0, 0] = 1.0
+        x = torch.randn(4, HIDDEN_DIM, device=device)
+        x_copy = x.clone()
+        req_map = torch.zeros(4, dtype=torch.long, device=device)
+
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
+        )
+        assert torch.equal(x, x_copy)
 
 
 # ─── mask_blend ──────────────────────────────────────────────────────────────
@@ -353,10 +330,17 @@ class TestMaskBlend:
 
 @requires_cuda
 class TestEndToEnd:
+    def _make_flat_buf(self, device):
+        total = NUM_LAYERS * MAX_TOKENS
+        flat_buf = torch.zeros(total, HIDDEN_DIM, device=device)
+        offsets = torch.arange(0, total, MAX_TOKENS, dtype=torch.int64, device=device)
+        base_indices = torch.arange(MAX_TOKENS, dtype=torch.int64, device=device)
+        return flat_buf, offsets, base_indices
+
     def test_observe_then_blend(self, device):
         """Observe and blend in sequence, like a real layer."""
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
+        flat_buf, offsets, base_indices = self._make_flat_buf(device)
+        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, dtype=torch.float32, device=device)
         obs_mask[0, 0] = 1.0
 
         scale = torch.ones(NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM, device=device)
@@ -368,34 +352,46 @@ class TestEndToEnd:
         req_map = torch.zeros(4, dtype=torch.long, device=device)
 
         # Observe first (records x before blend)
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
         )
         # Then blend
         out = mask_blend(x, layer_idx=0, scale=scale, add=add, req_map=req_map)
 
-        # Ring has original x
-        assert torch.allclose(ring_buf[:4], x, atol=1e-6)
+        # Buffer has original x
+        assert torch.allclose(flat_buf[:4], x, atol=1e-6)
         # Output is steered
         assert torch.allclose(out, x + steer_v.unsqueeze(0), atol=1e-6)
 
     def test_identity_is_noop(self, device):
         """All masks identity/zero — output equals input exactly."""
-        ring_buf = torch.zeros(RING_SIZE, HIDDEN_DIM, device=device)
-        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
+        flat_buf, offsets, base_indices = self._make_flat_buf(device)
+        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, dtype=torch.float32, device=device)
         scale = torch.ones(NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM, device=device)
         add = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM, device=device)
 
         x = torch.randn(4, HIDDEN_DIM, device=device)
         req_map = torch.zeros(4, dtype=torch.long, device=device)
 
-        observe_prefill(
-            x, layer_idx=0, ring_buf=ring_buf, obs_mask=obs_mask, req_map=req_map, write_offset=0
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
         )
         out = mask_blend(x, layer_idx=0, scale=scale, add=add, req_map=req_map)
 
-        # Ring should be zero (obs_mask=0)
-        assert torch.all(ring_buf[:4] == 0)
+        # Buffer should be zero (obs_mask=0)
+        assert torch.all(flat_buf[:4] == 0)
         # Output should equal input (scale=1, add=0)
         assert torch.allclose(out, x, atol=1e-6)
 

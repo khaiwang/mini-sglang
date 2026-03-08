@@ -1,0 +1,465 @@
+<mxfile host="app.diagrams.net" modified="2026-03-07" agent="Claude" version="24.0">
+  <diagram id="intervention-comparison" name="Intervention Design Comparison">
+    <mxGraphModel dx="2800" dy="2200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="3300" pageHeight="2400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- =============================== -->
+        <!-- TITLE                            -->
+        <!-- =============================== -->
+        <mxCell id="title" value="&lt;b&gt;Intervention Architecture Comparison&lt;/b&gt;" style="text;html=1;fontSize=22;fontFamily=Helvetica;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="600" y="20" width="1100" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="nnsight (Hook-based) vs mini-sglang (Buffer+Mask) vs Goodfire (Activation Collection)" style="text;html=1;fontSize=13;fontFamily=Helvetica;align=center;verticalAlign=middle;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="55" width="1100" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- =============================== -->
+        <!-- COLUMN 1: nnsight                -->
+        <!-- =============================== -->
+
+        <!-- Column header -->
+        <mxCell id="col1_header" value="&lt;b&gt;nnsight&lt;/b&gt;&lt;br&gt;Hook-based Intervention" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontFamily=Helvetica;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="80" y="110" width="600" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- User Code -->
+        <mxCell id="n_user" value="&lt;b&gt;User Code&lt;/b&gt;&lt;br&gt;&lt;font face=&quot;Courier New&quot; size=&quot;1&quot;&gt;with model.trace(input):&lt;br&gt;&amp;nbsp; act = model.layers[L].output.save()&lt;br&gt;&amp;nbsp; model.layers[L].output[:] = steering_vec&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;fontFamily=Helvetica;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="80" y="180" width="600" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Tracing / Envoy -->
+        <mxCell id="n_trace" value="&lt;b&gt;Tracing Context Manager&lt;/b&gt;&lt;br&gt;Envoy proxies wrap nn.Module tree&lt;br&gt;Records operations as a computation graph" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="270" width="600" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="n_arrow1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_user" target="n_trace">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Hook Registration -->
+        <mxCell id="n_hooks" value="&lt;b&gt;Hook Registration&lt;/b&gt;&lt;br&gt;&lt;font face=&quot;Courier New&quot; size=&quot;1&quot;&gt;module.register_forward_hook(fn)&lt;/font&gt;&lt;br&gt;Python callbacks attached to nn.Module nodes&lt;br&gt;Dynamic: added before forward, removed after" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="340" width="600" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="n_arrow2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_trace" target="n_hooks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Model Forward (with hooks) -->
+        <mxCell id="n_model_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="80" y="420" width="600" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="n_model_title" value="&lt;b&gt;Model Forward Pass (nn.Module)&lt;/b&gt;" style="text;html=1;fontSize=12;fontFamily=Helvetica;align=center;fontColor=#7c5295;" vertex="1" parent="1">
+          <mxGeometry x="80" y="425" width="600" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_layer0" value="Layer 0 forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="455" width="360" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="n_hook0" value="&lt;font color=&quot;#cc0000&quot;&gt;&lt;b&gt;Python Hook&lt;/b&gt;&lt;/font&gt;&lt;br&gt;if hook registered: callback(module, input, output)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="200" y="495" width="360" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="n_ha0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_layer0" target="n_hook0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_dots1" value="..." style="text;html=1;fontSize=14;align=center;" vertex="1" parent="1">
+          <mxGeometry x="350" y="535" width="60" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_layerN" value="Layer N forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="560" width="360" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="n_hookN" value="&lt;font color=&quot;#cc0000&quot;&gt;&lt;b&gt;Python Hook&lt;/b&gt;&lt;/font&gt;&lt;br&gt;if hook registered: callback(module, input, output)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="200" y="600" width="360" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="n_haN" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_layerN" target="n_hookN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_lm_head" value="LM Head" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="650" width="360" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_arrow3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_hooks" target="n_model_box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- nnsight output -->
+        <mxCell id="n_output" value="&lt;b&gt;Output&lt;/b&gt;&lt;br&gt;Saved activations + modified output" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="80" y="720" width="600" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="n_arrow4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="n_model_box" target="n_output">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- nnsight characteristics -->
+        <mxCell id="n_chars" value="&lt;b&gt;Characteristics&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Python callback per layer = GIL contention&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Not CUDA graph compatible (dynamic dispatch)&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Requires nn.Module (not compatible with BaseOP)&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Per-request hooks on shared model = concurrency issues&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Zero overhead when no hooks registered&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Fine-grained: any module, input or output&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Flexible: arbitrary Python in callbacks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=10;verticalAlign=top;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="80" y="780" width="600" height="140" as="geometry" />
+        </mxCell>
+
+        <!-- =============================== -->
+        <!-- COLUMN 2: mini-sglang            -->
+        <!-- =============================== -->
+
+        <!-- Column header -->
+        <mxCell id="col2_header" value="&lt;b&gt;mini-sglang&lt;/b&gt;&lt;br&gt;Buffer+Mask Intervention" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;fontFamily=Helvetica;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="740" y="110" width="620" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- User API -->
+        <mxCell id="m_user" value="&lt;b&gt;User API (InterventionRequest)&lt;/b&gt;&lt;br&gt;&lt;font face=&quot;Courier New&quot; size=&quot;1&quot;&gt;req.observe(layer=5)&lt;br&gt;&amp;nbsp;&amp;nbsp; .steer(layer=12, vector=v, alpha=0.5)&lt;br&gt;&amp;nbsp;&amp;nbsp; .ablate(layer=20)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;fontFamily=Helvetica;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="740" y="180" width="620" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- InterventionManager -->
+        <mxCell id="m_manager" value="&lt;b&gt;InterventionManager (CPU)&lt;/b&gt;&lt;br&gt;Translates requests → mask tensor updates&lt;br&gt;prepare_step(): reset obs, update masks | process_step(): dispatch observations" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="270" width="620" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="m_arrow1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_user" target="m_manager">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Mask + Obs Buffers -->
+        <mxCell id="m_buffers_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="740" y="340" width="620" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m_mask_buf" value="&lt;b&gt;MaskBuffer&lt;/b&gt;&lt;br&gt;scale[L, table_idx, H]&lt;br&gt;add[L, table_idx, H]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="755" y="348" width="190" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="m_obs_ring" value="&lt;b&gt;ObsRingBuffer&lt;/b&gt;&lt;br&gt;(prefill, eager)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="960" y="348" width="150" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="m_obs_flat" value="&lt;b&gt;DecodeObsBuffer&lt;/b&gt;&lt;br&gt;(decode, CUDA graph)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="348" width="155" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="m_arrow2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_manager" target="m_buffers_box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Model Forward (with fixed ops) -->
+        <mxCell id="m_model_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="740" y="420" width="620" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="m_model_title" value="&lt;b&gt;Model Forward Pass (BaseOP)&lt;/b&gt;" style="text;html=1;fontSize=12;fontFamily=Helvetica;align=center;fontColor=#7c5295;" vertex="1" parent="1">
+          <mxGeometry x="740" y="425" width="620" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m_layer0" value="Layer 0 forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="830" y="455" width="200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="m_obs0" value="&lt;font color=&quot;#0066cc&quot;&gt;&lt;b&gt;observe()&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="450" width="100" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="m_blend0" value="&lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;blend()&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;font size=&quot;1&quot; face=&quot;Courier New&quot;&gt;x*scale + add&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="472" width="100" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="m_ha0a" style="edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=1;exitY=0.3;exitDx=0;exitDy=0;" edge="1" parent="1" source="m_layer0" target="m_obs0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m_ha0b" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_obs0" target="m_blend0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- req_map annotation -->
+        <mxCell id="m_reqmap" value="&lt;font face=&quot;Courier New&quot; size=&quot;1&quot;&gt;req_map: [tokens] -&gt; table_idx&lt;/font&gt;&lt;br&gt;per-request, per-layer masks" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;fontSize=9;dashed=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1165" y="450" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m_dots1" value="..." style="text;html=1;fontSize=14;align=center;" vertex="1" parent="1">
+          <mxGeometry x="900" y="508" width="60" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m_layerN" value="Layer N forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="830" y="535" width="200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="m_obsN" value="&lt;font color=&quot;#0066cc&quot;&gt;&lt;b&gt;observe()&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="530" width="100" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="m_blendN" value="&lt;font color=&quot;#009900&quot;&gt;&lt;b&gt;blend()&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;font size=&quot;1&quot; face=&quot;Courier New&quot;&gt;x*scale + add&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="552" width="100" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="m_haNa" style="edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=1;exitY=0.3;exitDx=0;exitDy=0;" edge="1" parent="1" source="m_layerN" target="m_obsN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m_haNb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_obsN" target="m_blendN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Identity annotation -->
+        <mxCell id="m_identity_note" value="&lt;i&gt;obs_mask=0, scale=1, add=0&lt;br&gt;= numerical no-op (zero overhead path)&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;fontSize=9;dashed=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1165" y="540" width="180" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m_lm_head" value="LM Head" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="830" y="600" width="200" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- CUDA graph annotation -->
+        <mxCell id="m_cuda_note" value="&lt;b&gt;CUDA Graph Compatible&lt;/b&gt;&lt;br&gt;Fixed topology, data-driven enable/disable&lt;br&gt;Decode: captured in graph&lt;br&gt;Prefill: runs eagerly" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6ffcc;strokeColor=#82b366;fontSize=10;fontColor=#336600;" vertex="1" parent="1">
+          <mxGeometry x="830" y="645" width="290" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="m_arrow3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_buffers_box" target="m_model_box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- mini-sglang output -->
+        <mxCell id="m_output" value="&lt;b&gt;Output&lt;/b&gt;&lt;br&gt;Modified logits + async observation pipeline to CPU" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="720" width="620" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="m_arrow4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="m_model_box" target="m_output">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- mini-sglang characteristics -->
+        <mxCell id="m_chars" value="&lt;b&gt;Characteristics&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; CUDA graph compatible (no hooks, no dynamic dispatch)&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Per-request, per-layer granularity via req_map gather&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Multi-request batching with different interventions&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Both observe (read) AND blend (write) in same pass&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Async 3-stage pipeline (GPU obs -&gt; async D2H -&gt; CPU)&lt;br&gt;&lt;font color=&quot;#ffaa00&quot;&gt;&#x25CF;&lt;/font&gt; Fixed kernel launch overhead (~5-10us x 2 x num_layers)&lt;br&gt;&lt;font color=&quot;#ffaa00&quot;&gt;&#x25CF;&lt;/font&gt; Post-layer residual stream only (no sub-module access)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=10;verticalAlign=top;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="740" y="780" width="620" height="140" as="geometry" />
+        </mxCell>
+
+        <!-- =============================== -->
+        <!-- COLUMN 3: Goodfire               -->
+        <!-- =============================== -->
+
+        <!-- Column header -->
+        <mxCell id="col3_header" value="&lt;b&gt;Goodfire&lt;/b&gt;&lt;br&gt;Activation Collection" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=14;fontFamily=Helvetica;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="110" width="600" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Goodfire input -->
+        <mxCell id="g_user" value="&lt;b&gt;Batch of Prompts&lt;/b&gt;&lt;br&gt;High-throughput bulk inference&lt;br&gt;Goal: harvest activations at scale for SAE training" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;fontFamily=Helvetica;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="180" width="600" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Collection Config -->
+        <mxCell id="g_config" value="&lt;b&gt;Collection Config&lt;/b&gt;&lt;br&gt;Which layers to observe (often all layers)&lt;br&gt;Batch-level, not per-request granularity" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="270" width="600" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrow1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="g_user" target="g_config">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Pre-allocated Buffers -->
+        <mxCell id="g_buffers" value="&lt;b&gt;Pre-allocated GPU Buffers&lt;/b&gt;&lt;br&gt;Fixed-size activation storage + dedicated copy stream" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="340" width="600" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrow2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="g_config" target="g_buffers">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Model Forward (observe only) -->
+        <mxCell id="g_model_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="420" width="600" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="g_model_title" value="&lt;b&gt;Model Forward Pass&lt;/b&gt;" style="text;html=1;fontSize=12;fontFamily=Helvetica;align=center;fontColor=#7c5295;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="425" width="600" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_layer0" value="Layer 0 forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1530" y="455" width="200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="g_collect0" value="&lt;font color=&quot;#0066cc&quot;&gt;&lt;b&gt;collect()&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;font size=&quot;1&quot;&gt;copy to staging buffer&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1750" y="450" width="130" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="g_ha0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" parent="1" source="g_layer0" target="g_collect0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_d2h0" value="&lt;font color=&quot;#cc6600&quot;&gt;&lt;b&gt;async D2H&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1900" y="455" width="80" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="g_d2h0_arrow" style="edgeStyle=orthogonalEdgeStyle;rounded=0;dashed=1;strokeColor=#d79b00;" edge="1" parent="1" source="g_collect0" target="g_d2h0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_dots1" value="..." style="text;html=1;fontSize=14;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1600" y="498" width="60" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_layerN" value="Layer N forward()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1530" y="525" width="200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="g_collectN" value="&lt;font color=&quot;#0066cc&quot;&gt;&lt;b&gt;collect()&lt;/b&gt;&lt;/font&gt;&lt;br&gt;&lt;font size=&quot;1&quot;&gt;copy to staging buffer&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1750" y="520" width="130" height="35" as="geometry" />
+        </mxCell>
+        <mxCell id="g_haN" style="edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" parent="1" source="g_layerN" target="g_collectN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_d2hN" value="&lt;font color=&quot;#cc6600&quot;&gt;&lt;b&gt;async D2H&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1900" y="525" width="80" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="g_d2hN_arrow" style="edgeStyle=orthogonalEdgeStyle;rounded=0;dashed=1;strokeColor=#d79b00;" edge="1" parent="1" source="g_collectN" target="g_d2hN">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_lm_head" value="LM Head" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1530" y="575" width="200" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- No blend annotation -->
+        <mxCell id="g_no_blend" value="&lt;b&gt;Read-only&lt;/b&gt;&lt;br&gt;No blend/write ops&lt;br&gt;Activations are never modified" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;fontColor=#996600;" vertex="1" parent="1">
+          <mxGeometry x="1530" y="620" width="290" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_arrow3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="g_buffers" target="g_model_box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Goodfire CPU pipeline -->
+        <mxCell id="g_output" value="&lt;b&gt;CPU Processing Pipeline&lt;/b&gt;&lt;br&gt;SAE feature extraction, storage to disk/DB" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="720" width="600" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrow4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" edge="1" parent="1" source="g_model_box" target="g_output">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Goodfire characteristics -->
+        <mxCell id="g_chars" value="&lt;b&gt;Characteristics&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Optimized for massive throughput (bulk harvest)&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Async 3-stage pipeline overlaps GPU+CPU&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Pre-allocated fixed buffers (no dynamic alloc)&lt;br&gt;&lt;font color=&quot;#009900&quot;&gt;&#x2714;&lt;/font&gt; Dedicated copy stream avoids compute stalls&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Read-only: no activation modification (no steer/ablate)&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Batch-level collection, not per-request granularity&lt;br&gt;&lt;font color=&quot;#cc0000&quot;&gt;&#x2716;&lt;/font&gt; Not designed for online serving (offline batch job)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=10;verticalAlign=top;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="780" width="600" height="140" as="geometry" />
+        </mxCell>
+
+        <!-- =============================== -->
+        <!-- BOTTOM: Key Insight Comparison   -->
+        <!-- =============================== -->
+
+        <mxCell id="bottom_title" value="&lt;b&gt;Key Design Insight: mini-sglang = Goodfire's async pipeline + nnsight's intervention semantics, made CUDA-graph-safe&lt;/b&gt;" style="text;html=1;fontSize=14;fontFamily=Helvetica;align=center;verticalAlign=middle;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="400" y="950" width="1500" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Comparison table -->
+        <mxCell id="table_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#cccccc;" vertex="1" parent="1">
+          <mxGeometry x="200" y="990" width="1900" height="200" as="geometry" />
+        </mxCell>
+
+        <!-- Table headers -->
+        <mxCell id="th0" value="&lt;b&gt;Dimension&lt;/b&gt;" style="text;html=1;fontSize=11;fontFamily=Helvetica;align=center;verticalAlign=middle;fontColor=#333;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1000" width="280" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="th1" value="&lt;b&gt;nnsight (Hook-based)&lt;/b&gt;" style="text;html=1;fontSize=11;fontFamily=Helvetica;align=center;verticalAlign=middle;fillColor=#dae8fc;strokeColor=#6c8ebf;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1000" width="460" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="th2" value="&lt;b&gt;mini-sglang (Buffer+Mask)&lt;/b&gt;" style="text;html=1;fontSize=11;fontFamily=Helvetica;align=center;verticalAlign=middle;fillColor=#d5e8d4;strokeColor=#82b366;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1000" width="460" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="th3" value="&lt;b&gt;Goodfire (Collection)&lt;/b&gt;" style="text;html=1;fontSize=11;fontFamily=Helvetica;align=center;verticalAlign=middle;fillColor=#f8cecc;strokeColor=#b85450;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1000" width="460" height="25" as="geometry" />
+        </mxCell>
+
+        <!-- Row 1: Mechanism -->
+        <mxCell id="r1c0" value="&lt;b&gt;Mechanism&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1030" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c1" value="Python hooks on nn.Module" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1030" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c2" value="Fixed tensor ops (observe + blend) at every layer" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1030" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r1c3" value="Buffer collect + async D2H copy stream" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1030" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Row 2: CUDA Graphs -->
+        <mxCell id="r2c0" value="&lt;b&gt;CUDA Graph Safe&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1055" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c1" value="&lt;font color=&quot;#cc0000&quot;&gt;No&lt;/font&gt; — hooks are Python callbacks" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1055" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c2" value="&lt;font color=&quot;#009900&quot;&gt;Yes&lt;/font&gt; — fixed topology, data-driven masks" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1055" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r2c3" value="N/A — offline batch processing" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1055" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Row 3: Read/Write -->
+        <mxCell id="r3c0" value="&lt;b&gt;Read / Write&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1080" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c1" value="Both (arbitrary Python in hook)" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1080" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c2" value="Both (observe=read, blend=write)" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1080" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r3c3" value="Read-only (collect activations)" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1080" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Row 4: Granularity -->
+        <mxCell id="r4c0" value="&lt;b&gt;Granularity&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1105" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c1" value="Any module, input/output, sub-module" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1105" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c2" value="Post-layer residual stream, per-request per-layer" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1105" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r4c3" value="Per-layer, batch-level (not per-request)" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1105" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Row 5: Batching -->
+        <mxCell id="r5c0" value="&lt;b&gt;Multi-Request Batching&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1130" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c1" value="Difficult — hooks are global on shared model" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1130" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c2" value="Native — req_map maps tokens to per-request masks" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1130" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r5c3" value="All requests get same collection (uniform)" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1130" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Row 6: Use Case -->
+        <mxCell id="r6c0" value="&lt;b&gt;Primary Use Case&lt;/b&gt;" style="text;html=1;fontSize=10;align=left;spacingLeft=5;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1155" width="280" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c1" value="Research: flexible interp on single model" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1155" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c2" value="Online serving: interp + steering at scale" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="970" y="1155" width="460" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="r6c3" value="Offline: bulk activation harvest for SAE training" style="text;html=1;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="1155" width="460" height="22" as="geometry" />
+        </mxCell>
+
+        <!-- Horizontal separator lines -->
+        <mxCell id="sep1" value="" style="line;strokeWidth=1;strokeColor=#dddddd;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1052" width="1690" height="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sep2" value="" style="line;strokeWidth=1;strokeColor=#dddddd;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1077" width="1690" height="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sep3" value="" style="line;strokeWidth=1;strokeColor=#dddddd;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1102" width="1690" height="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sep4" value="" style="line;strokeWidth=1;strokeColor=#dddddd;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1127" width="1690" height="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sep5" value="" style="line;strokeWidth=1;strokeColor=#dddddd;" vertex="1" parent="1">
+          <mxGeometry x="210" y="1152" width="1690" height="1" as="geometry" />
+        </mxCell>
+
+        <!-- =============================== -->
+        <!-- Arrows showing lineage          -->
+        <!-- =============================== -->
+        <mxCell id="inspire1" value="&lt;i&gt;intervention semantics&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;dashed=1;strokeColor=#6c8ebf;fontColor=#6c8ebf;fontSize=10;exitX=1;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="col1_header" target="col2_header">
+          <mxGeometry x="-0.3" y="15" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="inspire2" value="&lt;i&gt;async pipeline&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;dashed=1;strokeColor=#b85450;fontColor=#b85450;fontSize=10;exitX=0;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="col3_header" target="col2_header">
+          <mxGeometry x="0.3" y="15" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

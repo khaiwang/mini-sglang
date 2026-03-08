@@ -1,15 +1,12 @@
 from minisgl.intervention.buffers import (
-    DecodeObservationBuffer,
     MaskBuffer,
-    ObservationRingBuffer,
+    ObservationBuffer,
 )
-from minisgl.intervention.ops import mask_blend, observe_decode, observe_prefill
+from minisgl.intervention.ops import mask_blend, observe
 
 __all__ = [
-    "ObservationRingBuffer",
-    "DecodeObservationBuffer",
+    "ObservationBuffer",
     "MaskBuffer",
-    "observe_prefill",
-    "observe_decode",
+    "observe",
     "mask_blend",
 ]

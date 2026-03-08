@@ -1,21 +1,19 @@
-"""Tests for intervention buffer classes: ObservationRingBuffer, DecodeObservationBuffer, MaskBuffer."""
+"""Tests for intervention buffer classes: ObservationBuffer, MaskBuffer."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 from minisgl.intervention.buffers import (
-    DecodeObservationBuffer,
     MaskBuffer,
-    ObservationRingBuffer,
+    ObservationBuffer,
 )
 
 # Small test sizes
-RING_SIZE = 64
 NUM_LAYERS = 4
 HIDDEN_DIM = 16
 MAX_RUNNING_REQ = 8
-MAX_DECODE_BS = 8
+MAX_TOKENS = 8
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -25,211 +23,48 @@ def device():
     return torch.device("cuda:0")
 
 
-# ─── ObservationRingBuffer ───────────────────────────────────────────────────
+# ─── ObservationBuffer ─────────────────────────────────────────────────────
 
 
 @requires_cuda
-class TestObservationRingBuffer:
-    def _make_buf(self, device):
-        return ObservationRingBuffer(
-            ring_size=RING_SIZE,
-            hidden_dim=HIDDEN_DIM,
+class TestObservationBuffer:
+    def _make_buf(self, device, max_tokens=MAX_TOKENS, dtype=torch.float32):
+        return ObservationBuffer(
             num_layers=NUM_LAYERS,
-            max_running_req=MAX_RUNNING_REQ,
+            max_tokens_per_slot=max_tokens,
+            hidden_dim=HIDDEN_DIM,
             device=device,
+            dtype=dtype,
         )
 
     def test_init_shapes(self, device):
         buf = self._make_buf(device)
-        assert buf._buf.shape == (RING_SIZE, HIDDEN_DIM)
-        assert buf._obs_mask.shape == (NUM_LAYERS, MAX_RUNNING_REQ)
-        assert buf._cpu_staging.shape == (RING_SIZE, HIDDEN_DIM)
-        assert buf._buf.device.type == "cuda"
-        assert buf._cpu_staging.is_pinned()
-
-    def test_write_single_layer(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)  # all req 0
-        buf._obs_mask[0, 0] = 1.0  # enable layer 0, req 0
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        torch.cuda.synchronize()
-
-        # Data should be at offset 0
-        written = buf._buf[:n_tokens]
-        assert torch.allclose(written, x, atol=1e-6)
-
-    def test_write_advances_ptr(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 10
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[0, 0] = 1.0
-
-        assert buf._write_ptr == 0
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        assert buf._write_ptr == n_tokens
-
-    def test_write_wraps_around(self, device):
-        buf = self._make_buf(device)
-        req_map = torch.zeros(1, dtype=torch.long, device=device)
-        buf._obs_mask[0, 0] = 1.0
-
-        # Write enough to get near the end
-        n_tokens = RING_SIZE - 2
-        x1 = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        buf.write(x1, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map[:1].expand(n_tokens))
-        assert buf._write_ptr == n_tokens
-
-        # Write more to wrap around
-        x2 = torch.randn(4, HIDDEN_DIM, device=device)
-        req_map4 = torch.zeros(4, dtype=torch.long, device=device)
-        buf.write(x2, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map4)
-        # (RING_SIZE - 2 + 4) % RING_SIZE = 2
-        assert buf._write_ptr == (n_tokens + 4) % RING_SIZE
-
-    def test_flush_returns_all(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[:, 0] = 1.0  # enable all layers for req 0
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        buf.write(x, layer_idx=1, obs_mask=buf._obs_mask, req_map=req_map)
-
-        results = buf.flush()
-        assert len(results) == 2
-        assert results[0][0] == 0  # layer_idx
-        assert results[1][0] == 1
-
-    def test_flush_data_correctness(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[0, 0] = 1.0
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        results = buf.flush()
-
-        assert len(results) == 1
-        layer_idx, cpu_data = results[0]
-        assert layer_idx == 0
-        assert cpu_data.device.type == "cpu"
-        assert torch.allclose(cpu_data, x.cpu(), atol=1e-6)
-
-    def test_poll_completed(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[0, 0] = 1.0
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        # Synchronize to ensure copy completes
-        torch.cuda.synchronize()
-        buf._copy_stream.synchronize()
-
-        results = buf.poll()
-        assert len(results) == 1
-        assert results[0][0] == 0
-
-    def test_poll_does_not_block(self, device):
-        buf = self._make_buf(device)
-        # With no writes, poll should return empty immediately
-        results = buf.poll()
-        assert results == []
-
-    def test_reset_clears_state(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[0, 0] = 1.0
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        buf._copy_stream.synchronize()
-        buf.reset()
-
-        assert buf._write_ptr == 0
-        assert len(buf._pending) == 0
-        assert torch.all(buf._buf == 0)
-
-    def test_masked_write(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 6
-        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-        # req_map: tokens 0-2 → req 0, tokens 3-5 → req 1
-        req_map = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long, device=device)
-        # Only observe req 0 at layer 0
-        buf._obs_mask[0, 0] = 1.0
-        buf._obs_mask[0, 1] = 0.0  # req 1 disabled
-
-        buf.write(x, layer_idx=0, obs_mask=buf._obs_mask, req_map=req_map)
-        torch.cuda.synchronize()
-
-        written = buf._buf[:n_tokens]
-        # Tokens 0-2 should match x, tokens 3-5 should be zero
-        assert torch.allclose(written[:3], x[:3], atol=1e-6)
-        assert torch.all(written[3:] == 0)
-
-    def test_multi_layer_workflow(self, device):
-        buf = self._make_buf(device)
-        n_tokens = 4
-        req_map = torch.zeros(n_tokens, dtype=torch.long, device=device)
-        buf._obs_mask[:, 0] = 1.0  # enable all layers for req 0
-
-        xs = []
-        for layer_idx in range(NUM_LAYERS):
-            x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
-            xs.append(x.cpu())
-            buf.write(x, layer_idx=layer_idx, obs_mask=buf._obs_mask, req_map=req_map)
-
-        results = buf.flush()
-        assert len(results) == NUM_LAYERS
-        for i, (layer_idx, cpu_data) in enumerate(results):
-            assert layer_idx == i
-            assert torch.allclose(cpu_data, xs[i], atol=1e-6)
-
-
-# ─── DecodeObservationBuffer ────────────────────────────────────────────────
-
-
-@requires_cuda
-class TestDecodeObservationBuffer:
-    def _make_buf(self, device):
-        return DecodeObservationBuffer(
-            num_layers=NUM_LAYERS,
-            max_decode_bs=MAX_DECODE_BS,
-            hidden_dim=HIDDEN_DIM,
-            max_running_req=MAX_RUNNING_REQ,
-            device=device,
-        )
-
-    def test_init_shapes(self, device):
-        buf = self._make_buf(device)
-        total_rows = NUM_LAYERS * MAX_DECODE_BS
+        total_rows = NUM_LAYERS * MAX_TOKENS
         assert buf._buf.shape == (total_rows, HIDDEN_DIM)
         assert buf._offsets.shape == (NUM_LAYERS,)
-        assert buf._base_indices.shape == (MAX_DECODE_BS,)
+        assert buf._base_indices.shape == (MAX_TOKENS,)
         assert buf._cpu_buf.shape == (total_rows, HIDDEN_DIM)
+        assert buf._buf.device.type == "cuda"
+        assert buf._cpu_buf.is_pinned()
+
+    def test_init_dtype(self, device):
+        buf = self._make_buf(device, dtype=torch.float16)
+        assert buf._buf.dtype == torch.float16
+        assert buf._cpu_buf.dtype == torch.float16
 
     def test_offsets_correct(self, device):
         buf = self._make_buf(device)
-        expected = torch.arange(0, NUM_LAYERS * MAX_DECODE_BS, MAX_DECODE_BS, dtype=torch.int64)
+        expected = torch.arange(0, NUM_LAYERS * MAX_TOKENS, MAX_TOKENS, dtype=torch.int64)
         assert torch.equal(buf._offsets.cpu(), expected)
 
     def test_get_write_args(self, device):
         buf = self._make_buf(device)
-        bs = 4
+        n_tokens = 4
         for layer_idx in range(NUM_LAYERS):
-            flat_buf, indices = buf.get_write_args(layer_idx, bs)
+            flat_buf, indices = buf.get_write_args(layer_idx, n_tokens)
             assert flat_buf is buf._buf
-            expected_indices = torch.arange(bs, dtype=torch.int64, device=device) + (
-                layer_idx * MAX_DECODE_BS
+            expected_indices = torch.arange(n_tokens, dtype=torch.int64, device=device) + (
+                layer_idx * MAX_TOKENS
             )
             assert torch.equal(indices, expected_indices)
 
@@ -241,7 +76,6 @@ class TestDecodeObservationBuffer:
 
     def test_copy_to_cpu(self, device):
         buf = self._make_buf(device)
-        # Write some known data
         data = torch.randn_like(buf._buf)
         buf._buf.copy_(data)
 
@@ -251,18 +85,43 @@ class TestDecodeObservationBuffer:
         assert cpu_result.device.type == "cpu"
         assert torch.allclose(cpu_result, data.cpu(), atol=1e-6)
 
+    def test_copy_to_cpu_returns_same_reference(self, device):
+        """copy_to_cpu returns internal pinned buffer — caller must process before next call."""
+        buf = self._make_buf(device)
+        ref1 = buf.copy_to_cpu()
+        ref2 = buf.copy_to_cpu()
+        assert ref1.data_ptr() == ref2.data_ptr()
+
+    def test_write_and_read_back(self, device):
+        """Write via index_copy_ (like observe op) and read back via copy_to_cpu."""
+        buf = self._make_buf(device)
+        n_tokens = 4
+        x = torch.randn(n_tokens, HIDDEN_DIM, device=device)
+
+        for layer_idx in range(NUM_LAYERS):
+            flat_buf, indices = buf.get_write_args(layer_idx, n_tokens)
+            flat_buf.index_copy_(0, indices, x)
+
+        cpu_result = buf.copy_to_cpu()
+        torch.cuda.synchronize()
+
+        for layer_idx in range(NUM_LAYERS):
+            start = layer_idx * MAX_TOKENS
+            assert torch.allclose(cpu_result[start : start + n_tokens], x.cpu(), atol=1e-6)
+
 
 # ─── MaskBuffer ──────────────────────────────────────────────────────────────
 
 
 @requires_cuda
 class TestMaskBuffer:
-    def _make_buf(self, device):
+    def _make_buf(self, device, dtype=torch.float32):
         return MaskBuffer(
             num_layers=NUM_LAYERS,
             max_running_req=MAX_RUNNING_REQ,
             hidden_dim=HIDDEN_DIM,
             device=device,
+            dtype=dtype,
         )
 
     def test_init_identity(self, device):
@@ -274,6 +133,11 @@ class TestMaskBuffer:
         buf = self._make_buf(device)
         assert buf._scale.shape == (NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM)
         assert buf._add.shape == (NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM)
+
+    def test_init_dtype(self, device):
+        buf = self._make_buf(device, dtype=torch.float16)
+        assert buf._scale.dtype == torch.float16
+        assert buf._add.dtype == torch.float16
 
     def test_reset(self, device):
         buf = self._make_buf(device)
