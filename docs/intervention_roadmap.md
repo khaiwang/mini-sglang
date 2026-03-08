@@ -11,11 +11,8 @@ Build an activation intervention system for mini-sglang that supports observe (r
 After each transformer layer's `forward()`, two tensor ops execute unconditionally:
 
 ```python
-# 1. Observe: write activations into observation buffer
-#    Prefill (eager): slice assignment into ring buffer, one layer at a time
-observe_prefill(x, layer_idx, ring_buf, obs_mask, req_map, write_offset)
-#    Decode (CUDA graph): index_copy_ into flat buffer with pre-computed offsets
-observe_decode(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets)
+# 1. Observe: write activations into flat observation buffer (same op for prefill and decode)
+observe(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets)
 
 # 2. Blend: apply per-request intervention masks (same for prefill and decode)
 x = x * scale[layer_idx, req_map] + add[layer_idx, req_map]  # [total_tokens, hidden_dim]
@@ -23,10 +20,11 @@ x = x * scale[layer_idx, req_map] + add[layer_idx, req_map]  # [total_tokens, hi
 
 Both ops:
 - **Always execute** — no branches, no conditionals, no hooks
-- **Blend is captured in CUDA graphs** (decode) or runs eagerly (prefill). **Observe has separate implementations**: `observe_prefill` (eager, ring buffer) and `observe_decode` (CUDA-graph-safe, flat buffer with `index_copy_`).
-- **CUDA graphs are only used for decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly, even with chunked prefill. This means prefill and decode can use different observation strategies.
+- **Both are CUDA-graph safe** — `observe` uses `index_copy_` with pre-computed offsets, `blend` is pure elementwise
+- **CUDA graphs are only used for decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly, even with chunked prefill.
 - **Reduce to no-ops via data**: `obs_mask=0` skips observation, `scale=1/add=0` is identity blend
 - **Support per-request, per-layer granularity** via `req_map` gather
+- **Two `ObservationBuffer` instances** at runtime: one sized for prefill (`max_extend_tokens`), one for decode (`max_decode_bs`). Same class, different sizes.
 
 ### Unified Prefill + Decode via `req_map`
 
@@ -74,66 +72,40 @@ Any observation pattern is expressible via the `obs_mask[layer, table_idx]` tens
 
 **Possible optimization (future):** fuse observe+blend into a single custom kernel per layer, halving kernel launch count.
 
-## Three-Stage Async Pipeline
+## Async Pipeline
 
-Inspired by [Goodfire's activation harvesting architecture](https://www.goodfire.ai/blog/interpretability-infra-at-frontier-scale):
-
-**Prefill (eager):** Ring buffer streams layer-by-layer. After each layer writes into the ring,
-a dedicated CUDA copy stream asynchronously drains the region to CPU pinned memory. Ring space
-is reclaimed as copies complete, allowing reuse without pre-allocating per-layer buffers.
+Both prefill and decode use the same flat `ObservationBuffer` pattern (different instances with different sizing). The pipeline is:
 
 ```
-Stage 1 (GPU, per layer)          Stage 2 (async, per layer)       Stage 3 (CPU, overlapped)
+Stage 1 (GPU, per layer)          Stage 2 (after forward)          Stage 3 (CPU, overlapped)
 ─────────────────────────────     ─────────────────────────        ──────────────────────────
-observe_prefill() writes          Ring buffer's copy stream         InterventionManager.step()
-masked activations into ring      async copies region to CPU        reads observations via
-at write_ptr. No allocation.      pinned staging. Ring space        poll()/flush(), runs
-                                  freed for reuse.                  handlers, updates masks.
+observe() index_copy_ into        copy_to_cpu() bulk copies        InterventionManager.step()
+flat buffer at each layer.        entire flat buffer to CPU         reads observations, runs
+Pre-computed offsets, graph-safe. pinned memory. Non-blocking.      handlers, updates masks.
 ```
 
-**Decode (CUDA graph):** Uses a separate small flat buffer with pre-computed layer offsets.
-`observe_decode()` uses `index_copy_` with GPU tensor indices (CUDA-graph safe). Bulk-copied
-to CPU after graph replay.
+**Prefill buffer**: `ObservationBuffer(num_layers, max_extend_tokens, hidden_dim, device, dtype)` — may be large for big models, but simple and correct.
 
-```
-Stage 1 (GPU, in graph)           Stage 2 (after replay)           Stage 3 (CPU, overlapped)
-─────────────────────────────     ─────────────────────────        ──────────────────────────
-observe_decode() index_copy_      copy_to_cpu() bulk copies         Same as prefill stage 3.
-into flat buffer at each layer.   entire flat buffer to CPU.
-Pre-computed offsets, graph-safe. Non-blocking.
-```
+**Decode buffer**: `ObservationBuffer(num_layers, max_decode_bs, hidden_dim, device, dtype)` — small (~144MB for 8B models).
+
+**Future optimization (see `claude.todos.md`):** Replace the prefill instance with a streaming ring buffer to reduce GPU memory from `num_layers * max_tokens * hidden_dim` to `ring_size * hidden_dim`, with per-layer async D2H copies.
 
 ## Components
 
 ### `intervention/buffers.py` — Pre-allocated GPU Tensors
 
 ```python
-class ObservationRingBuffer:
-    # Streaming ring buffer for prefill observations (eager execution only)
-    _buf: Tensor              # [ring_size, hidden_dim] — GPU ring buffer
-    _obs_mask: Tensor         # [num_layers, max_running_req] — per-request per-layer enable
-    _write_ptr: int           # current write position (CPU-tracked)
-    _copy_stream: Stream      # dedicated CUDA stream for async D2H copies
-    _cpu_staging: Tensor      # [ring_size, hidden_dim] — pinned CPU memory
-    _pending: List[ObsEntry]  # in-flight copies: (layer_idx, offset, length, event)
-
-    def write(x, layer_idx, obs_mask, req_map) -> None: ...   # write + async copy
-    def poll() -> List[Tuple[int, Tensor]]: ...                # non-blocking check
-    def flush() -> List[Tuple[int, Tensor]]: ...               # sync all pending
-    def reset() -> None: ...
-    def available_space() -> int: ...
-
-class DecodeObservationBuffer:
-    # Flat buffer for decode observations (CUDA graph compatible)
-    _buf: Tensor              # [num_layers * max_decode_bs, hidden_dim]
-    _obs_mask: Tensor         # [num_layers, max_running_req]
+class ObservationBuffer:
+    # Flat pre-allocated buffer for layer observations (prefill or decode)
+    # Two instances at runtime with different max_tokens_per_slot sizing
+    _buf: Tensor              # [num_layers * max_tokens_per_slot, hidden_dim]
     _offsets: Tensor          # [num_layers] — pre-computed layer offsets
-    _base_indices: Tensor     # [max_decode_bs] — [0, 1, 2, ...]
+    _base_indices: Tensor     # [max_tokens_per_slot] — [0, 1, 2, ...]
     _cpu_buf: Tensor          # pinned CPU staging
 
-    def get_write_args(layer_idx, bs) -> Tuple[Tensor, Tensor]: ...
+    def get_write_args(layer_idx, n_tokens) -> Tuple[Tensor, Tensor]: ...
     def reset() -> None: ...
-    def copy_to_cpu() -> Tensor: ...
+    def copy_to_cpu() -> Tensor: ...  # returns ref to internal pinned buf (aliased!)
 
 class MaskBuffer:
     # Per-request, per-layer intervention masks
@@ -146,21 +118,20 @@ class MaskBuffer:
     def set_patch(self, layer, table_idx, activation) -> None: ...
 ```
 
+All buffer classes accept a `dtype` parameter (default `torch.float32`) to match model precision and avoid type promotion overhead.
+
 All attributes `_`-prefixed to hide from `BaseOP.state_dict()`.
+
+`obs_mask` is a standalone tensor `[num_layers, max_running_req]` — not stored inside buffer classes. Passed as an argument to the `observe` op.
 
 Buffer sizes: `max_obs_tokens = max_extend_tokens`, `max_running_req` from `EngineConfig`. Pre-allocated once at engine init, reused across all forward passes.
 
 ### `intervention/ops.py` — Pure Tensor Functions
 
 ```python
-def observe_prefill(x, layer_idx, ring_buf, obs_mask, req_map, write_offset):
-    """Write observation into ring buffer at write_offset. Eager mode only."""
-    per_token_mask = obs_mask[layer_idx, req_map]               # [total_tokens]
-    masked = x * per_token_mask.unsqueeze(-1)                   # [total_tokens, hidden_dim]
-    ring_buf[write_offset:write_offset + n] = masked
-
-def observe_decode(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets):
-    """Write observation into flat buffer using index_copy_. CUDA-graph safe."""
+def observe(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets):
+    """Write observation into flat buffer using index_copy_. CUDA-graph safe.
+    Works for both prefill and decode — only buffer sizing differs."""
     per_token_mask = obs_mask[layer_idx, req_map]
     masked = x * per_token_mask.unsqueeze(-1)
     indices = base_indices[:x.shape[0]] + offsets[layer_idx]
@@ -264,9 +235,11 @@ def forward(self, input_ids):
     ictx = get_intervention_ctx()
     if ictx is not None:
         batch = get_global_ctx().batch
+        obs_buf = ictx.obs_buffer
         for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
-            observe(x, i, ictx.obs_buffer.active_buf, ictx.obs_buffer._obs_mask, batch.req_map)
+            flat_buf, indices = obs_buf.get_write_args(i, x.shape[0])
+            observe(x, i, flat_buf, ictx.obs_mask, batch.req_map, obs_buf._base_indices, obs_buf._offsets)
             x = mask_blend(x, i, ictx.mask_buffer._scale, ictx.mask_buffer._add, batch.req_map)
     else:
         for layer in self.layers.op_list:
@@ -288,8 +261,8 @@ python/minisgl/intervention/
 └── request.py           # InterventionRequest (user-facing API)
 
 tests/intervention/
-├── test_buffers.py      # Buffer allocation, route/mask updates, ping-pong swap
-├── test_ops.py          # Op correctness: identity, ablation, steering, multi-request
+├── test_buffers.py      # ObservationBuffer (shapes, offsets, write/read, copy_to_cpu), MaskBuffer
+├── test_ops.py          # observe (unified), mask_blend, end-to-end observe+blend
 ├── test_req_map.py      # req_map plumbing: prefill packing, decode identity, graph buffer
 └── test_e2e.py          # End-to-end with real model (spawn scheduler subprocess)
 
@@ -299,15 +272,17 @@ benchmark/intervention/
 
 ## Implementation Steps
 
-### Step 1: Buffers + Ops (no integration yet)
+### Step 1: Buffers + Ops (no integration yet) — DONE
 
 **Files:** `intervention/buffers.py`, `intervention/ops.py`, `tests/intervention/test_buffers.py`, `tests/intervention/test_ops.py`
 
-Build and test in isolation with mock tensors (no model, no engine):
-- `ObservationBuffer`: allocation, `reset_active()`, `swap()`, double-buffer correctness
-- `MaskBuffer`: allocation, `reset()`, `set_ablate/steer/patch`, verify tensor values
-- `observe()`: verify accumulation with various `obs_mask` patterns (single layer, multi-layer, multi-request)
-- `mask_blend()`: verify identity (scale=1, add=0), ablation (scale=0, add=0), steering (scale=1, add=v), multi-request isolation via `req_map`
+Built and tested in isolation with mock tensors (no model, no engine):
+- `ObservationBuffer`: unified flat buffer for both prefill and decode, with `get_write_args()`, `copy_to_cpu()` (aliased return documented), `reset()`, `dtype` parameterization
+- `MaskBuffer`: allocation, `reset()`, `set_ablate/steer/patch`, `dtype` parameterization
+- `observe()`: single unified function using `index_copy_` — tested with various `obs_mask` patterns (single layer, multi-layer, multi-request, prefill-style, decode-style)
+- `mask_blend()`: verified identity, ablation, steering, patching, multi-request isolation via `req_map`
+- `obs_mask` is a standalone tensor, not stored inside buffer classes
+- 37 tests, 100% coverage on intervention module
 
 ### Step 2: Context + `req_map` Plumbing
 
@@ -396,8 +371,11 @@ Metrics: tokens/sec (prefill + decode), per-step latency, GPU utilization.
 | `_`-prefixed buffer attributes | `BaseOP.state_dict()` skips `_`-prefixed names — buffers hidden from model checkpoints |
 | `if ictx is not None` branch at capture time | Graph topology fixed at capture. Vanilla mode (no intervention) avoids all overhead |
 | Intervene after full layer (post-MLP, post-allreduce) | Clean hidden state, TP-merged activations, no fusion broken |
-| Double-buffered obs_buf | GPU writes buffer A while CPU reads buffer B — no stalls |
 | Ops at every layer, data-driven enable | CUDA graphs require fixed topology. Per-request per-layer `obs_mask` controls which layers are active for which requests |
+| Unified `ObservationBuffer` for prefill and decode | Same class, two instances with different sizing. Simpler than separate ring + flat buffer classes. Ring buffer optimization deferred (see `claude.todos.md`) |
+| `obs_mask` as standalone tensor, not in buffer | Avoids dead state — buffer classes are pure storage, masking logic lives in `observe()` op |
+| `dtype` parameter on all buffers | Match model precision to avoid type promotion in `mask_blend` and 2x memory waste |
+| `copy_to_cpu()` returns aliased internal buffer | Intentional for async pipeline — avoids allocation per call. Documented that caller must process before next call |
 
 ## What This Proves
 
@@ -409,6 +387,7 @@ Metrics: tokens/sec (prefill + decode), per-step latency, GPU utilization.
 
 ## Future Work (Not in This Demo)
 
+- Ring buffer optimization for prefill observations (see `claude.todos.md`) — reduce GPU memory from `num_layers * max_tokens * hidden_dim` to `ring_size * hidden_dim`
 - KV cache dirty page tracking / prefix cache pollution from interventions
 - `torch.compile` fusion of intervention ops with adjacent kernels
 - Real nnsight API translation layer
