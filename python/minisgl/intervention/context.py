@@ -16,7 +16,7 @@ class InterventionContext:
 
     obs_buffer: ObservationBuffer
     mask_buffer: MaskBuffer
-    obs_mask: torch.Tensor  # [num_layers, max_running_req]
+    obs_mask: torch.Tensor  # [num_layers, max_running_req + 1] (+1 sentinel for padding)
 
 
 _INTERVENTION_CTX: InterventionContext | None = None

@@ -131,8 +131,9 @@ class TestMaskBuffer:
 
     def test_init_shapes(self, device):
         buf = self._make_buf(device)
-        assert buf._scale.shape == (NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM)
-        assert buf._add.shape == (NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM)
+        num_slots = MAX_RUNNING_REQ + 1  # +1 sentinel
+        assert buf._scale.shape == (NUM_LAYERS, num_slots, HIDDEN_DIM)
+        assert buf._add.shape == (NUM_LAYERS, num_slots, HIDDEN_DIM)
 
     def test_init_dtype(self, device):
         buf = self._make_buf(device, dtype=torch.float16)

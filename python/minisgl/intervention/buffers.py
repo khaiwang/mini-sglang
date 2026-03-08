@@ -66,6 +66,10 @@ class MaskBuffer:
     """Per-request, per-layer intervention masks for blend operations.
 
     Default state is identity: scale=1.0, add=0.0 (no-op blend).
+
+    Internally allocates ``max_running_req + 1`` slots so that the dummy
+    request (``table_idx = max_running_req``) used for CUDA-graph padding
+    indexes into a valid sentinel slot that stays at identity.
     """
 
     def __init__(
@@ -81,13 +85,14 @@ class MaskBuffer:
         self._hidden_dim = hidden_dim
         self._device = device
 
+        num_slots = max_running_req + 1  # +1 sentinel for dummy/padding requests
         # Multiplicative mask — default 1.0 (identity)
         self._scale = torch.ones(
-            num_layers, max_running_req, hidden_dim, dtype=dtype, device=device
+            num_layers, num_slots, hidden_dim, dtype=dtype, device=device
         )
         # Additive mask — default 0.0 (identity)
         self._add = torch.zeros(
-            num_layers, max_running_req, hidden_dim, dtype=dtype, device=device
+            num_layers, num_slots, hidden_dim, dtype=dtype, device=device
         )
 
     def reset(self) -> None:
