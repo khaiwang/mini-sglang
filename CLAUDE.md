@@ -93,6 +93,10 @@ All source is under `python/minisgl/`. Key module relationships:
 - **Global context**: `core.py` maintains a global `Context` singleton accessed via `get_global_ctx()`. Layers read batch/KV cache state from this context rather than receiving it as arguments.
 - **Overlap scheduling**: `Scheduler.overlap_loop()` overlaps GPU execution of the current batch with CPU processing of the previous batch's results, using separate CUDA streams.
 
+## Workflow Rules
+
+- **Plan before coding**: When starting work on an implementation step (e.g., "step 3"), always enter plan mode first. Propose a concrete plan with exact file changes, code snippets, and test strategy before writing any code.
+
 ## Intervention System (Buffer+Mask)
 
 See **[`docs/intervention_roadmap.md`](docs/intervention_roadmap.md)** for the full design and implementation plan.

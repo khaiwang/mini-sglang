@@ -8,6 +8,7 @@ from minisgl.intervention.context import (
     get_intervention_ctx,
     set_intervention_ctx,
 )
+from minisgl.intervention.hooks import unwrap_layers, wrap_layers
 from minisgl.intervention.ops import mask_blend, observe
 
 __all__ = [
@@ -19,4 +20,6 @@ __all__ = [
     "clear_intervention_ctx",
     "observe",
     "mask_blend",
+    "wrap_layers",
+    "unwrap_layers",
 ]
