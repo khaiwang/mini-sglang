@@ -76,6 +76,7 @@ class Batch:
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)
+    req_map: torch.Tensor = field(init=False)  # [total_tokens] → table_idx
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)

@@ -206,6 +206,7 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
+        batch.req_map = input_mapping[0]  # [total_tokens] → table_idx
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
