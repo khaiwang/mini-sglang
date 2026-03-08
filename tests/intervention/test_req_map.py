@@ -138,13 +138,11 @@ class TestInterventionContext:
         clear_intervention_ctx()
 
     def _make_ctx(self, device):
-        prefill_obs = ObservationBuffer(NUM_LAYERS, MAX_TOKENS, HIDDEN_DIM, device)
-        decode_obs = ObservationBuffer(NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM, device)
+        obs = ObservationBuffer(NUM_LAYERS, MAX_TOKENS, HIDDEN_DIM, device)
         mask = MaskBuffer(NUM_LAYERS, MAX_RUNNING_REQ, HIDDEN_DIM, device)
         obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, device=device)
         return InterventionContext(
-            prefill_obs_buffer=prefill_obs,
-            decode_obs_buffer=decode_obs,
+            obs_buffer=obs,
             mask_buffer=mask,
             obs_mask=obs_mask,
         )
@@ -191,8 +189,7 @@ class TestInterventionContext:
         ctx = self._make_ctx(device)
         set_intervention_ctx(ctx)
         retrieved = get_intervention_ctx()
-        assert isinstance(retrieved.prefill_obs_buffer, ObservationBuffer)
-        assert isinstance(retrieved.decode_obs_buffer, ObservationBuffer)
+        assert isinstance(retrieved.obs_buffer, ObservationBuffer)
         assert isinstance(retrieved.mask_buffer, MaskBuffer)
         assert retrieved.obs_mask.shape == (NUM_LAYERS, MAX_RUNNING_REQ)
 

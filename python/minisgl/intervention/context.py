@@ -8,14 +8,13 @@ from minisgl.intervention.buffers import MaskBuffer, ObservationBuffer
 
 @dataclass
 class InterventionContext:
-    """Holds all intervention state: observation buffers, mask buffer, and obs_mask.
+    """Holds all intervention state: observation buffer, mask buffer, and obs_mask.
 
-    Two named obs buffers (prefill-sized, decode-sized). Caller picks based on
-    ``batch.is_prefill``. ``obs_mask`` is standalone — not inside buffer classes.
+    Single unified obs buffer sized for the larger of prefill/decode token counts.
+    ``obs_mask`` is standalone — not inside buffer classes.
     """
 
-    prefill_obs_buffer: ObservationBuffer
-    decode_obs_buffer: ObservationBuffer
+    obs_buffer: ObservationBuffer
     mask_buffer: MaskBuffer
     obs_mask: torch.Tensor  # [num_layers, max_running_req]
 

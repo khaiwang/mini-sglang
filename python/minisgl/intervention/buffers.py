@@ -6,12 +6,9 @@ import torch
 
 
 class ObservationBuffer:
-    """Flat pre-allocated buffer for layer observations (prefill or decode).
+    """Flat pre-allocated buffer for layer observations.
 
-    Two instances at runtime:
-    - Prefill: ObservationBuffer(num_layers, max_extend_tokens, hidden_dim, device, dtype)
-    - Decode:  ObservationBuffer(num_layers, max_decode_bs, hidden_dim, device, dtype)
-
+    Single instance at runtime, sized for the larger of prefill/decode token counts.
     Uses index_copy_ for CUDA-graph-safe writes. Bulk-copied to CPU after use.
     """
 
