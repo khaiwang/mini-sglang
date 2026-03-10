@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from minisgl.core import get_global_ctx
 from minisgl.intervention.context import InterventionContext
-from minisgl.intervention.ops import mask_blend, observe
+from minisgl.intervention.ops import blend, observe
 
 
 def wrap_layers(layers: list, ictx: InterventionContext) -> None:
-    """Wrap each layer's forward() to run observe + mask_blend after execution.
+    """Wrap each layer's forward() to run observe + blend after execution.
 
     Call before CUDA graph capture so graphs include intervention ops.
     Identity masks (scale=1, add=0, obs_mask=0) make ops numerical no-ops.
@@ -27,7 +27,8 @@ def _wrap_one(layer, layer_idx: int, ictx: InterventionContext) -> None:
     original_forward = layer.forward
     layer._original_forward = original_forward  # _ hides from BaseOP.state_dict()
 
-    obs_buf = ictx.obs_buffer
+    x_buf = ictx.x_obs_buffer
+    res_buf = ictx.residual_obs_buffer
     mb = ictx.mask_buffer
     obs_mask = ictx.obs_mask
 
@@ -35,10 +36,14 @@ def _wrap_one(layer, layer_idx: int, ictx: InterventionContext) -> None:
         x, residual = original_forward(x, residual)
         req_map = get_global_ctx().batch.req_map
         observe(
-            x, layer_idx, obs_buf._buf, obs_mask,
-            req_map, obs_buf._base_indices, obs_buf._offsets,
+            x, layer_idx, x_buf._buf, obs_mask,
+            req_map, x_buf._base_indices, x_buf._offsets,
         )
-        x = mask_blend(x, layer_idx, mb._scale, mb._add, req_map)
+        observe(
+            residual, layer_idx, res_buf._buf, obs_mask,
+            req_map, res_buf._base_indices, res_buf._offsets,
+        )
+        x, residual = blend(x, residual, layer_idx, mb._scale, mb._add, req_map)
         return x, residual
 
     layer.forward = hooked_forward

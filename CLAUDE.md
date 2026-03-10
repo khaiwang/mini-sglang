@@ -128,24 +128,25 @@ The nnsight library (`~/nnsight/`) is the reference for intervention API design.
 
 ### Summary
 
-Two fixed tensor ops inserted after each transformer layer: **observe** (read activations) and **blend** (modify activations). Separate observation strategies for prefill vs decode:
+Three fixed tensor ops inserted after each transformer layer via hook wrapping: **dual observe** (read both `x` and `residual`) and **split blend** (modify activations). This captures both sides of the fused-norm split to match nnsight's hidden-state semantics:
 
 ```python
-# After each layer's forward():
-# Prefill (eager): ring buffer with async D2H drain
-observe_prefill(x, layer_idx, ring_buf, obs_mask, req_map, write_offset)
-# Decode (CUDA graph): flat buffer with index_copy_
-observe_decode(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets)
-# Blend (same for both): per-request scale + add
-x = x * scale[layer_idx, req_map] + add[layer_idx, req_map]
+# After each layer's forward() (injected by wrap_layers):
+# 1. Observe x (MLP output) into flat buffer
+observe(x, layer_idx, x_flat_buf, obs_mask, req_map, base_indices, offsets)
+# 2. Observe residual into separate flat buffer
+observe(residual, layer_idx, res_flat_buf, obs_mask, req_map, base_indices, offsets)
+# 3. Split blend: scale on both, add on x only
+x, residual = blend(x, residual, layer_idx, scale, add, req_map)
 ```
 
 Key design decisions:
 - **`req_map: [total_tokens] → table_idx`** unifies prefill (packed multi-request) and decode (one token per request). Already computed in `_make_input_tuple()`. Added to `Batch` and `GraphCaptureBuffer`.
 - **Masks indexed by `(layer, table_idx)`** — per-request, per-layer granularity. `req_map` gather broadcasts to per-token. Different requests in the same batch can target different layers without branching.
 - **CUDA graphs only apply to decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly. This allows different observation strategies: ring buffer (prefill) vs flat buffer (decode).
-- **Ring buffer for prefill observations**: fixed-size GPU ring buffer with a dedicated CUDA copy stream for async D2H. Avoids pre-allocating `[num_layers × max_tokens × hidden_dim]` (9+ GB for 8B models). Ring space is reused as async copies complete.
-- **Flat buffer for decode observations**: small pre-allocated buffer (`num_layers × max_decode_bs × hidden_dim`, ~144MB for 8B models). Uses `index_copy_` with pre-computed offsets for CUDA graph compatibility.
+- **Dual observe (x + residual)**: captures both sides of the fused-norm split. Users reconstruct full hidden state `h = x + residual` on CPU if needed.
+- **Split blend**: `scale` applies to both `x` and `residual`, `add` applies to `x` only. Algebraically equivalent to `h' = (x + residual) * scale + add` — matching nnsight's hidden-state-level intervention without breaking fused norm.
+- **Flat buffer for observations**: pre-allocated buffer (`num_layers × max_tokens_per_slot × hidden_dim`). Uses `index_copy_` with pre-computed offsets for CUDA graph compatibility.
 - **Data-driven, no control flow**: ops execute at every layer; identity masks (`scale=1, add=0, obs_mask=0`) make them no-ops. CUDA graph topology is fixed.
 - **`_`-prefixed buffer attributes** hide from `BaseOP.state_dict()`.
-- **Three-stage async pipeline**: GPU observe → async GPU→CPU copy (per-layer for prefill via ring, bulk for decode) → CPU processing in `_process_last_data()`.
+- **Three-stage async pipeline**: GPU observe → async GPU→CPU copy (bulk) → CPU processing in `_process_last_data()`.

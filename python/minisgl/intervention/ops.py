@@ -31,23 +31,30 @@ def observe(
     flat_buf.index_copy_(0, indices, masked)
 
 
-def mask_blend(
+def blend(
     x: torch.Tensor,
+    residual: torch.Tensor,
     layer_idx: int,
     scale: torch.Tensor,
     add: torch.Tensor,
     req_map: torch.Tensor,
-) -> torch.Tensor:
-    """Apply per-request intervention. Works in both eager and graph mode.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-request intervention to both x and residual.
+
+    Split blend: scale applies to both x and residual, add applies to x only.
+    Algebraically equivalent to h' = (x + residual) * scale + add on the full
+    hidden state, without breaking the fused norm optimization.
 
     Args:
-        x: [total_tokens, hidden_dim] activations
+        x: [total_tokens, hidden_dim] MLP output
+        residual: [total_tokens, hidden_dim] residual stream
         layer_idx: which transformer layer
         scale: [num_layers, max_running_req, hidden_dim] multiplicative mask (default 1.0)
         add: [num_layers, max_running_req, hidden_dim] additive mask (default 0.0)
         req_map: [total_tokens] maps each token to its request's table_idx
 
     Returns:
-        [total_tokens, hidden_dim] blended activations
+        (x_blended, residual_blended) — both [total_tokens, hidden_dim]
     """
-    return x * scale[layer_idx, req_map] + add[layer_idx, req_map]
+    s = scale[layer_idx, req_map]
+    return x * s + add[layer_idx, req_map], residual * s

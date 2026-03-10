@@ -8,23 +8,30 @@ Build an activation intervention system for mini-sglang that supports observe (r
 
 ### Two Fixed Ops Per Layer
 
-After each transformer layer's `forward()`, two tensor ops execute unconditionally:
+After each transformer layer's `forward()`, three tensor ops execute unconditionally:
 
 ```python
-# 1. Observe: write activations into flat observation buffer (same op for prefill and decode)
-observe(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets)
+# 1. Observe x (MLP output) into flat observation buffer
+observe(x, layer_idx, x_flat_buf, obs_mask, req_map, base_indices, offsets)
 
-# 2. Blend: apply per-request intervention masks (same for prefill and decode)
-x = x * scale[layer_idx, req_map] + add[layer_idx, req_map]  # [total_tokens, hidden_dim]
+# 2. Observe residual into separate flat observation buffer
+observe(residual, layer_idx, res_flat_buf, obs_mask, req_map, base_indices, offsets)
+
+# 3. Blend: apply per-request intervention masks (split blend)
+#    scale applies to both x and residual, add applies to x only
+x, residual = blend(x, residual, layer_idx, scale, add, req_map)
+# Equivalent to: x = x * s + add[...], residual = residual * s
 ```
 
-Both ops:
+**Why dual observe + split blend?** Mini-sglang's fused norm splits the hidden state into `(x, residual)` — an internal optimization. In HuggingFace models (which nnsight targets), layer `.output` is the full hidden state `h = x + residual`. By observing both tensors separately, users can reconstruct the full hidden state on CPU. The split blend (`scale` on both, `add` on `x` only) is algebraically equivalent to `h' = (x + residual) * scale + add` — matching nnsight's hidden-state-level intervention — without breaking the fused norm optimization.
+
+All ops:
 - **Always execute** — no branches, no conditionals, no hooks
-- **Both are CUDA-graph safe** — `observe` uses `index_copy_` with pre-computed offsets, `blend` is pure elementwise
+- **All are CUDA-graph safe** — `observe` uses `index_copy_` with pre-computed offsets, `blend` is pure elementwise
 - **CUDA graphs are only used for decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly, even with chunked prefill.
 - **Reduce to no-ops via data**: `obs_mask=0` skips observation, `scale=1/add=0` is identity blend
 - **Support per-request, per-layer granularity** via `req_map` gather
-- **Two `ObservationBuffer` instances** at runtime: one sized for prefill (`max_extend_tokens`), one for decode (`max_decode_bs`). Same class, different sizes.
+- **Two `ObservationBuffer` instances per tensor** at runtime: one sized for prefill (`max_extend_tokens`), one for decode (`max_decode_bs`). Same class, different sizes.
 
 ### Unified Prefill + Decode via `req_map`
 
@@ -131,15 +138,17 @@ Buffer sizes: `max_obs_tokens = max_extend_tokens`, `max_running_req` from `Engi
 ```python
 def observe(x, layer_idx, flat_buf, obs_mask, req_map, base_indices, offsets):
     """Write observation into flat buffer using index_copy_. CUDA-graph safe.
-    Works for both prefill and decode — only buffer sizing differs."""
+    Works for both prefill and decode — only buffer sizing differs.
+    Called twice per layer: once for x, once for residual."""
     per_token_mask = obs_mask[layer_idx, req_map]
     masked = x * per_token_mask.unsqueeze(-1)
     indices = base_indices[:x.shape[0]] + offsets[layer_idx]
     flat_buf.index_copy_(0, indices, masked)
 
-def mask_blend(x, layer_idx, scale, add, req_map):
-    """Apply per-request intervention. Works in both eager and graph mode."""
-    return x * scale[layer_idx, req_map] + add[layer_idx, req_map]
+def blend(x, residual, layer_idx, scale, add, req_map):
+    """Split blend: scale on both, add on x only. Matches nnsight semantics."""
+    s = scale[layer_idx, req_map]
+    return x * s + add[layer_idx, req_map], residual * s
 ```
 
 ### `intervention/context.py` — Global Singleton
@@ -147,8 +156,10 @@ def mask_blend(x, layer_idx, scale, add, req_map):
 ```python
 @dataclass
 class InterventionContext:
-    obs_buffer: ObservationBuffer
+    x_obs_buffer: ObservationBuffer        # MLP output observations
+    residual_obs_buffer: ObservationBuffer  # residual stream observations
     mask_buffer: MaskBuffer
+    obs_mask: Tensor  # [num_layers, max_running_req + 1]
 
 _INTERVENTION_CTX: InterventionContext | None = None
 
@@ -228,41 +239,33 @@ def forward(self, input_ids):
         x, residual = layer.forward(x, residual)
     return self.norm.forward(x, residual)[0]
 
-# After:
-def forward(self, input_ids):
-    x = self.embed_tokens.forward(input_ids)
-    residual = None
-    ictx = get_intervention_ctx()
-    if ictx is not None:
-        batch = get_global_ctx().batch
-        obs_buf = ictx.obs_buffer
-        for i, layer in enumerate(self.layers.op_list):
-            x, residual = layer.forward(x, residual)
-            flat_buf, indices = obs_buf.get_write_args(i, x.shape[0])
-            observe(x, i, flat_buf, ictx.obs_mask, batch.req_map, obs_buf._base_indices, obs_buf._offsets)
-            x = mask_blend(x, i, ictx.mask_buffer._scale, ictx.mask_buffer._add, batch.req_map)
-    else:
-        for layer in self.layers.op_list:
-            x, residual = layer.forward(x, residual)
-    return self.norm.forward(x, residual)[0]
+# After (using hook-based wrapping — no model code changes needed):
+# In engine init, before CUDA graph capture:
+wrap_layers(model.layers.op_list, ictx)
+# Each layer's forward() is replaced with a closure that calls:
+#   x, residual = original_forward(x, residual)
+#   observe(x, ...)           # observe MLP output
+#   observe(residual, ...)    # observe residual stream
+#   x, residual = blend(x, residual, ...)  # split blend
+#   return x, residual
 ```
 
-The `if ictx is not None` is evaluated at CUDA graph capture time. Once captured, the graph permanently includes intervention ops. The `else` branch is for vanilla mode (no intervention context set at all).
+The wrapping happens before CUDA graph capture, so graphs permanently include intervention ops. Identity masks (`scale=1, add=0, obs_mask=0`) make them numerical no-ops. The `wrap_layers()` approach avoids modifying model files directly.
 
 ### New file structure
 
 ```
 python/minisgl/intervention/
-├── __init__.py          # Public exports: get/set_intervention_ctx, observe, mask_blend
+├── __init__.py          # Public exports: get/set_intervention_ctx, observe, blend
 ├── buffers.py           # ObservationBuffer, MaskBuffer
-├── ops.py               # observe(), mask_blend() — pure tensor functions
+├── ops.py               # observe(), blend() — pure tensor functions
 ├── context.py           # InterventionContext singleton
 ├── manager.py           # InterventionManager (CPU-side async)
 └── request.py           # InterventionRequest (user-facing API)
 
 tests/intervention/
 ├── test_buffers.py      # ObservationBuffer (shapes, offsets, write/read, copy_to_cpu), MaskBuffer
-├── test_ops.py          # observe (unified), mask_blend, end-to-end observe+blend
+├── test_ops.py          # observe (unified), blend (split), end-to-end observe+blend
 ├── test_req_map.py      # req_map plumbing: prefill packing, decode identity, graph buffer
 └── test_e2e.py          # End-to-end with real model (spawn scheduler subprocess)
 
@@ -370,6 +373,8 @@ Metrics: tokens/sec (prefill + decode), per-step latency, GPU utilization.
 | Masks indexed by `table_idx` not batch position | Stable per-request slot, masks persist as batch composition changes |
 | `_`-prefixed buffer attributes | `BaseOP.state_dict()` skips `_`-prefixed names — buffers hidden from model checkpoints |
 | `if ictx is not None` branch at capture time | Graph topology fixed at capture. Vanilla mode (no intervention) avoids all overhead |
+| Dual observe (x + residual) | Captures both sides of fused norm split; users reconstruct full hidden state on CPU |
+| Split blend (scale both, add x only) | Algebraically equivalent to nnsight's `h' = h * scale + add` without breaking fused norm |
 | Intervene after full layer (post-MLP, post-allreduce) | Clean hidden state, TP-merged activations, no fusion broken |
 | Ops at every layer, data-driven enable | CUDA graphs require fixed topology. Per-request per-layer `obs_mask` controls which layers are active for which requests |
 | Unified `ObservationBuffer` for prefill and decode | Same class, two instances with different sizing. Simpler than separate ring + flat buffer classes. Ring buffer optimization deferred (see `claude.todos.md`) |

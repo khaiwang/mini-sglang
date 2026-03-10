@@ -58,8 +58,14 @@ def device():
 
 @pytest.fixture
 def ictx(device):
-    """Create a minimal InterventionContext."""
-    obs_buf = ObservationBuffer(
+    """Create a minimal InterventionContext with dual obs buffers."""
+    x_obs_buf = ObservationBuffer(
+        num_layers=NUM_LAYERS,
+        max_tokens_per_slot=MAX_TOKENS,
+        hidden_dim=HIDDEN_DIM,
+        device=device,
+    )
+    res_obs_buf = ObservationBuffer(
         num_layers=NUM_LAYERS,
         max_tokens_per_slot=MAX_TOKENS,
         hidden_dim=HIDDEN_DIM,
@@ -74,7 +80,10 @@ def ictx(device):
     obs_mask = torch.zeros(
         NUM_LAYERS, MAX_RUNNING_REQ + 1, dtype=torch.float32, device=device
     )
-    return InterventionContext(obs_buffer=obs_buf, mask_buffer=mb, obs_mask=obs_mask)
+    return InterventionContext(
+        x_obs_buffer=x_obs_buf, residual_obs_buffer=res_obs_buf,
+        mask_buffer=mb, obs_mask=obs_mask,
+    )
 
 
 def _setup_global_ctx(device, req_map_data, page_size=1):
@@ -99,7 +108,8 @@ class TestWrapUnwrap:
     def test_wrap_replaces_forward(self):
         layer = MockLayer()
         ictx_dummy = InterventionContext.__new__(InterventionContext)
-        ictx_dummy.obs_buffer = None
+        ictx_dummy.x_obs_buffer = None
+        ictx_dummy.residual_obs_buffer = None
         ictx_dummy.mask_buffer = None
         ictx_dummy.obs_mask = None
         # Before wrapping, forward is a bound method from the class
@@ -112,7 +122,8 @@ class TestWrapUnwrap:
     def test_unwrap_restores_forward(self):
         layer = MockLayer()
         ictx_dummy = InterventionContext.__new__(InterventionContext)
-        ictx_dummy.obs_buffer = None
+        ictx_dummy.x_obs_buffer = None
+        ictx_dummy.residual_obs_buffer = None
         ictx_dummy.mask_buffer = None
         ictx_dummy.obs_mask = None
         wrap_layers([layer], ictx_dummy)
@@ -133,8 +144,8 @@ class TestWrapUnwrap:
 
 @requires_cuda
 class TestWrappedForward:
-    def test_identity_masks_preserve_output(self, device, ictx):
-        """With identity masks (scale=1, add=0, obs_mask=0), wrapped == unwrapped."""
+    def test_identity_preserves_both(self, device, ictx):
+        """With identity masks (scale=1, add=0, obs_mask=0), both x and residual unchanged."""
         layer = MockLayer()
         x = torch.randn(4, HIDDEN_DIM, device=device)
         req_map_data = [0, 0, 0, 0]
@@ -149,8 +160,8 @@ class TestWrappedForward:
         assert torch.allclose(x_wrapped, x_ref, atol=1e-6)
         assert torch.allclose(res_wrapped, res_ref, atol=1e-6)
 
-    def test_observe_writes_to_buffer(self, device, ictx):
-        """With obs_mask enabled, obs buffer gets non-zero data."""
+    def test_observe_writes_to_both_buffers(self, device, ictx):
+        """With obs_mask enabled, both x and residual obs buffers get non-zero data."""
         layer_idx = 0
         table_idx = 0
         ictx.obs_mask[layer_idx, table_idx] = 1.0
@@ -160,19 +171,22 @@ class TestWrappedForward:
         req_map_data = [table_idx] * 4
         _setup_global_ctx(device, req_map_data)
 
-        # Buffer should start at zero
-        assert torch.all(ictx.obs_buffer._buf == 0)
+        # Both buffers should start at zero
+        assert torch.all(ictx.x_obs_buffer._buf == 0)
+        assert torch.all(ictx.residual_obs_buffer._buf == 0)
 
         wrap_layers([layer], ictx)
         layer.forward(x.clone())
 
-        # The layer region in the obs buffer should now have data
+        # Both buffer regions should now have data
         start = layer_idx * MAX_TOKENS
-        observed = ictx.obs_buffer._buf[start : start + 4]
-        assert not torch.all(observed == 0)
+        x_observed = ictx.x_obs_buffer._buf[start : start + 4]
+        res_observed = ictx.residual_obs_buffer._buf[start : start + 4]
+        assert not torch.all(x_observed == 0)
+        assert not torch.all(res_observed == 0)
 
-    def test_blend_ablation_changes_output(self, device, ictx):
-        """Ablation (scale=0, add=0) produces different output than identity."""
+    def test_blend_ablation_zeros_both(self, device, ictx):
+        """Ablation (scale=0, add=0) zeros both x and residual."""
         layer_idx = 0
         table_idx = 0
         ictx.mask_buffer.set_ablate(layer_idx, table_idx)
@@ -182,19 +196,15 @@ class TestWrappedForward:
         req_map_data = [table_idx] * 4
         _setup_global_ctx(device, req_map_data)
 
-        # Unwrapped reference
-        x_ref, _ = MockLayer().forward(x.clone())
-
         wrap_layers([layer], ictx)
-        x_ablated, _ = layer.forward(x.clone())
+        x_ablated, res_ablated = layer.forward(x.clone())
 
-        # Ablated output should be zero
+        # Both should be zero
         assert torch.all(x_ablated == 0)
-        # And different from unwrapped
-        assert not torch.allclose(x_ablated, x_ref)
+        assert torch.all(res_ablated == 0)
 
-    def test_blend_steering_changes_output(self, device, ictx):
-        """Steering (scale=1, add=vector) shifts output by the vector."""
+    def test_blend_steering_shifts_x_only(self, device, ictx):
+        """Steering (scale=1, add=vector) shifts x by the vector, residual unchanged."""
         layer_idx = 0
         table_idx = 0
         steer_v = torch.randn(HIDDEN_DIM, device=device)
@@ -206,13 +216,15 @@ class TestWrappedForward:
         _setup_global_ctx(device, req_map_data)
 
         # Unwrapped reference
-        x_ref, _ = MockLayer().forward(x.clone())
+        x_ref, res_ref = MockLayer().forward(x.clone())
 
         wrap_layers([layer], ictx)
-        x_steered, _ = layer.forward(x.clone())
+        x_steered, res_steered = layer.forward(x.clone())
 
-        expected = x_ref + steer_v.unsqueeze(0)
-        assert torch.allclose(x_steered, expected, atol=1e-6)
+        expected_x = x_ref + steer_v.unsqueeze(0)
+        assert torch.allclose(x_steered, expected_x, atol=1e-6)
+        # residual unchanged (scale=1, no add applied to residual)
+        assert torch.allclose(res_steered, res_ref, atol=1e-6)
 
     def test_multi_layer_wrap(self, device, ictx):
         """Wrapping multiple layers: each writes to correct buffer region."""
@@ -231,27 +243,15 @@ class TestWrappedForward:
         for layer in layers:
             current, residual = layer.forward(current, residual)
 
-        # Check each layer's observation region has non-zero data
+        # Check each layer's x observation region has non-zero data
         for layer_idx in range(NUM_LAYERS):
             start = layer_idx * MAX_TOKENS
-            observed = ictx.obs_buffer._buf[start : start + 2]
-            assert not torch.all(observed == 0), f"Layer {layer_idx} obs buffer is all zeros"
-
-    def test_residual_passthrough(self, device, ictx):
-        """Wrapped forward preserves residual from original layer."""
-        layer = MockLayer(bias=2.0)
-        x = torch.randn(4, HIDDEN_DIM, device=device)
-        req_map_data = [0, 0, 0, 0]
-        _setup_global_ctx(device, req_map_data)
-
-        # Get reference residual from unwrapped
-        _, res_ref = MockLayer(bias=2.0).forward(x.clone())
-
-        wrap_layers([layer], ictx)
-        _, res_wrapped = layer.forward(x.clone())
-
-        # Residual should be unchanged (hooks only modify x)
-        assert torch.allclose(res_wrapped, res_ref, atol=1e-6)
+            x_observed = ictx.x_obs_buffer._buf[start : start + 2]
+            assert not torch.all(x_observed == 0), f"Layer {layer_idx} x obs buffer is all zeros"
+            res_observed = ictx.residual_obs_buffer._buf[start : start + 2]
+            assert not torch.all(
+                res_observed == 0
+            ), f"Layer {layer_idx} residual obs buffer is all zeros"
 
 
 if __name__ == "__main__":
