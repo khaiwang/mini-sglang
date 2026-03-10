@@ -297,25 +297,29 @@ Built and tested in isolation with mock tensors (no model, no engine):
 - Set `batch.req_map` in `Scheduler._prepare_batch()` using table_idx from `_make_input_tuple()`
 - Test: verify `req_map` values are correct for prefill (packed multi-request) and decode (one per request)
 
-### Step 3: Model Integration
+### Step 3: Hook Wrapping for Model Integration — DONE
 
-**Files:** `models/llama.py`, `models/qwen2.py`, `models/qwen3.py`, `models/qwen3_moe.py`
+**Files:** `intervention/hooks.py`, `tests/intervention/test_hooks.py`
 
-- Modify `*Model.forward()` layer loops to call `observe()` + `mask_blend()` when intervention context is set
-- Extract shared helper if possible to avoid duplicating the pattern
-- Test: with `enable_intervention=False`, verify no behavior change (intervention context not set → vanilla path)
+- `wrap_layers()` replaces each layer's `forward()` with a closure that calls observe (x + residual) + blend
+- `unwrap_layers()` restores original forward methods
+- No model file modifications needed — wrapping happens at engine init before CUDA graph capture
+- Tests verify wrapping/unwrapping, identity pass-through, and observation correctness
 
-### Step 4: Engine Integration
+### Step 4: Engine Integration — DONE
 
-**Files:** `engine/config.py`, `engine/engine.py`, `engine/engine.py` (ForwardOutput)
+**Files:** `engine/config.py`, `engine/engine.py`, `server/args.py`
 
-- Add `enable_intervention: bool = False` to `EngineConfig`
+- Added `enable_intervention: bool = False` to `EngineConfig`
 - In `Engine.__init__`, after model load and before graph capture:
-  - Allocate `ObservationBuffer` and `MaskBuffer`
-  - Create and set `InterventionContext`
-- Add `obs_buf_cpu` to `ForwardOutput` (async-copied obs buffer from inactive ping-pong slot)
-- Add `--enable-intervention` to `server/args.py`
-- Test: engine init with intervention enabled, verify buffers allocated, graphs captured with intervention ops
+  - Allocate `ObservationBuffer` (x + residual) and `MaskBuffer`
+  - Create `obs_mask` tensor, `InterventionContext` singleton
+  - `wrap_layers()` on `model.model.layers.op_list`
+- `ForwardOutput` expanded with `x_obs_cpu` and `res_obs_cpu` (async-copied CPU tensors, default `None`)
+- `forward_batch()` calls `copy_to_cpu()` on both observation buffers when intervention is active
+- `shutdown()` calls `unwrap_layers()` and `clear_intervention_ctx()`
+- Added `--enable-intervention` CLI flag to `server/args.py`
+- Tests: config field, ForwardOutput fields, backward compat, CLI flag parsing
 
 ### Step 5: Manager + Request API
 

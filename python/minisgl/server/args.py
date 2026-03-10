@@ -223,6 +223,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    assert ServerArgs.enable_intervention is False
+    parser.add_argument(
+        "--enable-intervention",
+        action="store_true",
+        dest="enable_intervention",
+        help="Enable activation intervention (observe + blend hooks on each layer).",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 

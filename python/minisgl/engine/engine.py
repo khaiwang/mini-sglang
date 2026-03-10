@@ -24,6 +24,8 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    x_obs_cpu: torch.Tensor | None = None
+    res_obs_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -50,6 +52,49 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+
+        # ======================= Intervention setup ========================
+        if config.enable_intervention:
+            from minisgl.intervention import (
+                InterventionContext,
+                MaskBuffer,
+                ObservationBuffer,
+                set_intervention_ctx,
+                wrap_layers,
+            )
+
+            mc = config.model_config
+            obs_kwargs = {
+                "num_layers": mc.num_layers,
+                "max_tokens_per_slot": config.max_forward_len,
+                "hidden_dim": mc.hidden_size,
+                "device": self.device,
+                "dtype": self.dtype,
+            }
+            self._x_obs_buffer = ObservationBuffer(**obs_kwargs)
+            self._res_obs_buffer = ObservationBuffer(**obs_kwargs)
+            self._mask_buffer = MaskBuffer(
+                num_layers=mc.num_layers,
+                max_running_req=config.max_running_req,
+                hidden_dim=mc.hidden_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._obs_mask = torch.zeros(
+                mc.num_layers,
+                config.max_running_req + 1,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            ictx = InterventionContext(
+                x_obs_buffer=self._x_obs_buffer,
+                residual_obs_buffer=self._res_obs_buffer,
+                mask_buffer=self._mask_buffer,
+                obs_mask=self._obs_mask,
+            )
+            set_intervention_ctx(ictx)
+            wrap_layers(self.model.model.layers.op_list, ictx)
+            logger.info_rank0("Intervention enabled: buffers allocated, layers wrapped")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -203,11 +248,29 @@ class Engine:
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+
+        x_obs_cpu = res_obs_cpu = None
+        from minisgl.intervention import get_intervention_ctx
+
+        ictx = get_intervention_ctx()
+        if ictx is not None:
+            x_obs_cpu = ictx.x_obs_buffer.copy_to_cpu()
+            res_obs_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event, x_obs_cpu, res_obs_cpu
+        )
 
     def shutdown(self) -> None:
+        from minisgl.intervention import clear_intervention_ctx, get_intervention_ctx, unwrap_layers
+
+        ictx = get_intervention_ctx()
+        if ictx is not None:
+            unwrap_layers(self.model.model.layers.op_list)
+            clear_intervention_ctx()
+
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
