@@ -146,7 +146,7 @@ Key design decisions:
 - **CUDA graphs only apply to decode** (`graph.py:149` checks `batch.is_decode`). Prefill always runs eagerly. This allows different observation strategies: ring buffer (prefill) vs flat buffer (decode).
 - **Dual observe (x + residual)**: captures both sides of the fused-norm split. Users reconstruct full hidden state `h = x + residual` on CPU if needed.
 - **Split blend**: `scale` applies to both `x` and `residual`, `add` applies to `x` only. Algebraically equivalent to `h' = (x + residual) * scale + add` — matching nnsight's hidden-state-level intervention without breaking fused norm.
-- **Flat buffer for observations**: pre-allocated buffer (`num_layers × max_tokens_per_slot × hidden_dim`). Uses `index_copy_` with pre-computed offsets for CUDA graph compatibility.
+- **Flat buffer for observations**: pre-allocated buffer (`num_layers × max_tokens_per_slot × hidden_dim`). Uses `index_copy_` with pre-computed offsets for CUDA graph compatibility. `obs_mask` is always float32; `observe()` casts `per_token_mask` to `x.dtype` to keep computation in model dtype and avoid `index_copy_` dtype mismatches.
 - **Data-driven, no control flow**: ops execute at every layer; identity masks (`scale=1, add=0, obs_mask=0`) make them no-ops. CUDA graph topology is fixed.
 - **`_`-prefixed buffer attributes** hide from `BaseOP.state_dict()`.
-- **Three-stage async pipeline**: GPU observe → async GPU→CPU copy (bulk) → CPU processing in `_process_last_data()`.
+- **Three-stage async pipeline**: GPU observe → async GPU→CPU copy (bulk) → CPU processing in `_process_last_data()`. `ObservationBuffer.copy_to_cpu()` uses **ping-pong CPU buffers** (two pinned tensors, alternating via XOR flip) so overlap scheduling never corrupts the previous step's observation data.
