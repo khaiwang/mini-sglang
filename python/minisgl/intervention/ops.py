@@ -25,7 +25,7 @@ def observe(
         base_indices: [max_tokens_per_slot] pre-allocated [0, 1, 2, ...]
         offsets: [num_layers] pre-computed layer offsets into flat_buf
     """
-    per_token_mask = obs_mask[layer_idx, req_map]  # [n_tokens]
+    per_token_mask = obs_mask[layer_idx, req_map].to(dtype=x.dtype)  # [n_tokens]
     masked = x * per_token_mask.unsqueeze(-1)  # [n_tokens, hidden_dim]
     indices = base_indices[: x.shape[0]] + offsets[layer_idx]
     flat_buf.index_copy_(0, indices, masked)

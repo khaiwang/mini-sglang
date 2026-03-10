@@ -223,7 +223,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
-    assert ServerArgs.enable_intervention is False
+    assert ServerArgs.enable_intervention == False
     parser.add_argument(
         "--enable-intervention",
         action="store_true",

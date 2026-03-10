@@ -36,8 +36,12 @@ class ObservationBuffer:
         self._base_indices = torch.arange(
             max_tokens_per_slot, dtype=torch.int64, device=device
         )
-        # Pinned CPU buffer for async copy
-        self._cpu_buf = torch.zeros(total_rows, hidden_dim, dtype=dtype, pin_memory=True)
+        # Ping-pong pinned CPU buffers for async copy (two suffice for overlap scheduling)
+        self._cpu_bufs = [
+            torch.zeros(total_rows, hidden_dim, dtype=dtype, pin_memory=True),
+            torch.zeros(total_rows, hidden_dim, dtype=dtype, pin_memory=True),
+        ]
+        self._cpu_buf_idx = 0
 
     def get_write_args(self, layer_idx: int, n_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (buf, indices) for the observe op.
@@ -54,12 +58,14 @@ class ObservationBuffer:
     def copy_to_cpu(self) -> torch.Tensor:
         """Async copy entire buffer to CPU (non_blocking).
 
-        Returns a reference to the internal pinned staging buffer. Caller must
-        process the returned tensor before the next copy_to_cpu() call, which
-        overwrites it.
+        Uses ping-pong buffers: each call writes to the current buffer and
+        flips to the other. The returned tensor is safe to read until the
+        *next-next* call (two buffers, one step of overlap).
         """
-        self._cpu_buf.copy_(self._buf, non_blocking=True)
-        return self._cpu_buf
+        buf = self._cpu_bufs[self._cpu_buf_idx]
+        buf.copy_(self._buf, non_blocking=True)
+        self._cpu_buf_idx ^= 1
+        return buf
 
 
 class MaskBuffer:

@@ -7,6 +7,7 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.intervention import get_intervention_ctx
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -250,8 +251,6 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
 
         x_obs_cpu = res_obs_cpu = None
-        from minisgl.intervention import get_intervention_ctx
-
         ictx = get_intervention_ctx()
         if ictx is not None:
             x_obs_cpu = ictx.x_obs_buffer.copy_to_cpu()

@@ -43,14 +43,17 @@ class TestObservationBuffer:
         assert buf._buf.shape == (total_rows, HIDDEN_DIM)
         assert buf._offsets.shape == (NUM_LAYERS,)
         assert buf._base_indices.shape == (MAX_TOKENS,)
-        assert buf._cpu_buf.shape == (total_rows, HIDDEN_DIM)
+        assert len(buf._cpu_bufs) == 2
+        for cb in buf._cpu_bufs:
+            assert cb.shape == (total_rows, HIDDEN_DIM)
+            assert cb.is_pinned()
         assert buf._buf.device.type == "cuda"
-        assert buf._cpu_buf.is_pinned()
 
     def test_init_dtype(self, device):
         buf = self._make_buf(device, dtype=torch.float16)
         assert buf._buf.dtype == torch.float16
-        assert buf._cpu_buf.dtype == torch.float16
+        for cb in buf._cpu_bufs:
+            assert cb.dtype == torch.float16
 
     def test_offsets_correct(self, device):
         buf = self._make_buf(device)
@@ -85,12 +88,35 @@ class TestObservationBuffer:
         assert cpu_result.device.type == "cpu"
         assert torch.allclose(cpu_result, data.cpu(), atol=1e-6)
 
-    def test_copy_to_cpu_returns_same_reference(self, device):
-        """copy_to_cpu returns internal pinned buffer — caller must process before next call."""
+    def test_copy_to_cpu_ping_pong(self, device):
+        """copy_to_cpu alternates between two ping-pong buffers."""
         buf = self._make_buf(device)
+        ref1 = buf.copy_to_cpu()  # buf[0]
+        ref2 = buf.copy_to_cpu()  # buf[1]
+        ref3 = buf.copy_to_cpu()  # buf[0] again
+        assert ref1.data_ptr() != ref2.data_ptr()
+        assert ref1.data_ptr() == ref3.data_ptr()
+
+    def test_copy_to_cpu_preserves_previous(self, device):
+        """Data from call N is preserved when call N+1 writes to a different buffer."""
+        buf = self._make_buf(device)
+        # Write known data and copy
+        data1 = torch.randn_like(buf._buf)
+        buf._buf.copy_(data1)
         ref1 = buf.copy_to_cpu()
+        torch.cuda.synchronize()
+        expected1 = data1.cpu().clone()
+
+        # Write different data and copy (goes to other buffer)
+        data2 = torch.randn_like(buf._buf)
+        buf._buf.copy_(data2)
         ref2 = buf.copy_to_cpu()
-        assert ref1.data_ptr() == ref2.data_ptr()
+        torch.cuda.synchronize()
+
+        # ref1 still holds data1 (not corrupted by second copy)
+        assert torch.allclose(ref1, expected1, atol=1e-6)
+        # ref2 holds data2
+        assert torch.allclose(ref2, data2.cpu(), atol=1e-6)
 
     def test_write_and_read_back(self, device):
         """Write via index_copy_ (like observe op) and read back via copy_to_cpu."""

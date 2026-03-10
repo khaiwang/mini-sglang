@@ -159,6 +159,31 @@ class TestObserve:
         assert torch.allclose(flat_buf[0], x[0], atol=1e-6)
         assert torch.all(flat_buf[1] == 0)
 
+    def test_bfloat16_dtype(self, device):
+        """observe() with bfloat16 activations and float32 obs_mask must not crash."""
+        total = NUM_LAYERS * MAX_TOKENS
+        flat_buf = torch.zeros(total, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+        offsets = torch.arange(0, total, MAX_TOKENS, dtype=torch.int64, device=device)
+        base_indices = torch.arange(MAX_TOKENS, dtype=torch.int64, device=device)
+        obs_mask = torch.zeros(NUM_LAYERS, MAX_RUNNING_REQ, dtype=torch.float32, device=device)
+        obs_mask[0, 0] = 1.0
+
+        x = torch.randn(4, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+        req_map = torch.zeros(4, dtype=torch.long, device=device)
+
+        observe(
+            x,
+            layer_idx=0,
+            flat_buf=flat_buf,
+            obs_mask=obs_mask,
+            req_map=req_map,
+            base_indices=base_indices,
+            offsets=offsets,
+        )
+        assert flat_buf.dtype == torch.bfloat16
+        assert torch.allclose(flat_buf[:4], x, atol=1e-2)
+        assert torch.all(flat_buf[4:] == 0)
+
     def test_does_not_modify_x(self, device):
         flat_buf, offsets, base_indices, obs_mask = self._make_flat_buf(device)
         obs_mask[0, 0] = 1.0
