@@ -112,6 +112,28 @@ class TestInterventionRequest:
         req = InterventionRequest().steer(1, v)
         assert req.writes[0].alpha == 1.0
 
+    def test_conditional_write_once_default(self):
+        fn = lambda x, r: x
+        req = InterventionRequest().conditional_write(1, 3, fn)
+        assert req.conditional_writes[0].once is True
+
+    def test_conditional_write_once_false(self):
+        fn = lambda x, r: x
+        req = InterventionRequest().conditional_write(1, 3, fn, once=False)
+        assert req.conditional_writes[0].once is False
+
+
+class TestWriteOpValidation:
+    def test_valid_kinds_accepted(self):
+        for kind in ("ablate", "steer", "patch"):
+            WriteOp(layer=0, kind=kind)  # should not raise
+
+    def test_invalid_kind_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown write kind"):
+            WriteOp(layer=0, kind="abblate")
+
 
 if __name__ == "__main__":
     import pytest

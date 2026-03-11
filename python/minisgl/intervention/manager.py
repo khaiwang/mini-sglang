@@ -34,6 +34,7 @@ class InterventionManager:
         self._ctx = ctx
         self._active: Dict[int, _ActiveEntry] = {}
         self._needs_rerun: Set[int] = set()
+        self._token_offsets: Dict[int, Tuple[int, int]] = {}  # uid -> (start, length)
 
     # --- Lifecycle ---
 
@@ -77,6 +78,20 @@ class InterventionManager:
                 continue
             uid_to_table[req.uid] = req.table_idx
 
+        # Pre-compute token offsets now, before forward_batch / complete_one can
+        # mutate cached_len / device_len and make extend_len stale.
+        # NOTE: batch.reqs is the real-req prefix of padded_reqs (padding appended
+        # by pad_batch), so cumulative offsets here align with the flat observation
+        # buffer written by observe() using base_indices[:x.shape[0]].
+        self._token_offsets.clear()
+        offset = 0
+        for req in batch.reqs:
+            if isinstance(req, ChunkedReq):
+                continue
+            length = 1 if batch.is_decode else req.extend_len
+            self._token_offsets[req.uid] = (offset, length)
+            offset += length
+
         # 2. Apply interventions for active entries present in batch
         for uid, entry in self._active.items():
             if uid not in uid_to_table:
@@ -115,29 +130,18 @@ class InterventionManager:
     ) -> None:
         """Extract observations and run conditional write callbacks.
 
-        1. Compute per-req token offsets in flat buffer.
+        1. Use pre-computed token offsets from prepare_step.
         2. Extract layer slices from CPU buffers for observed layers.
-        3. Run conditional_write callbacks and queue resulting patches.
+        3. Run conditional_write callbacks (decode only) and queue resulting patches.
         """
-        from minisgl.scheduler.prefill import ChunkedReq
-
         if x_obs_cpu is None or res_obs_cpu is None:
             return
 
         max_tokens = self._ctx.x_obs_buffer._max_tokens_per_slot
 
-        # Build offset map: uid -> (start_offset, length) in flat buffer token dim
-        uid_offsets: Dict[int, Tuple[int, int]] = {}
-        offset = 0
-        for req in batch.reqs:
-            if isinstance(req, ChunkedReq):
-                continue
-            if batch.is_decode:
-                length = 1
-            else:
-                length = req.extend_len
-            uid_offsets[req.uid] = (offset, length)
-            offset += length
+        # Use token offsets pre-computed in prepare_step (immune to complete_one
+        # mutating cached_len/device_len between prepare and process).
+        uid_offsets = self._token_offsets
 
         # Process each active entry that has a table_idx in this batch
         for uid, entry in self._active.items():
@@ -162,15 +166,26 @@ class InterventionManager:
                 res_slice = res_obs_cpu[buf_start:buf_end].clone()
                 entry.observations[layer] = (x_slice, res_slice)
 
-            # Run conditional write callbacks
-            for cw_op in req.conditional_writes:
-                obs = entry.observations.get(cw_op.read_layer)
-                if obs is None:
-                    continue
-                x_obs, res_obs = obs
-                activation = cw_op.fn(x_obs, res_obs)
-                entry.pending_patches.append((cw_op.write_layer, activation))
-                self._needs_rerun.add(uid)
+            # Run conditional write callbacks (decode only — can't stall/rerun
+            # individual positions mid-prefill)
+            if batch.is_decode:
+                fired_indices = []
+                for i, cw_op in enumerate(req.conditional_writes):
+                    obs = entry.observations.get(cw_op.read_layer)
+                    if obs is None:
+                        continue
+                    x_obs, res_obs = obs
+                    activation = cw_op.fn(x_obs, res_obs)
+                    entry.pending_patches.append((cw_op.write_layer, activation))
+                    self._needs_rerun.add(uid)
+                    if cw_op.once:
+                        fired_indices.append(i)
+                # Remove one-shot conditional writes that fired
+                if fired_indices:
+                    fired = set(fired_indices)
+                    req.conditional_writes = [
+                        cw for i, cw in enumerate(req.conditional_writes) if i not in fired
+                    ]
 
     # --- Query ---
 

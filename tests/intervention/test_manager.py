@@ -494,5 +494,174 @@ class TestLifecycle:
         assert 10 not in manager._active
 
 
+# ─── TestPrefillOffsets ──────────────────────────────────────────────────────
+
+
+@requires_cuda
+class TestPrefillOffsets:
+    def test_extracts_prefill_observations_multi_req(self, manager, ictx, device):
+        """Two observed reqs in same prefill batch, verify both get correct offsets."""
+        req1 = InterventionRequest().observe(0)
+        req2 = InterventionRequest().observe(0)
+        manager.submit(10, req1)
+        manager.submit(20, req2)
+        # uid=10: 3 tokens, uid=20: 2 tokens
+        batch = _make_batch([(10, 0, 3, 0), (20, 1, 2, 0)], "prefill", device)
+        manager.prepare_step(batch)
+
+        # Write known data: 5 tokens at layer 0
+        data = torch.arange(5 * HIDDEN_DIM, dtype=torch.float32, device=device).reshape(
+            5, HIDDEN_DIM
+        )
+        ictx.x_obs_buffer._buf[:5] = data
+        ictx.residual_obs_buffer._buf[:5] = data * 2
+
+        x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+        res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+        torch.cuda.synchronize()
+
+        manager.process_step(x_cpu, res_cpu, batch)
+
+        obs1 = manager.get_observations(10)
+        assert 0 in obs1
+        x1, r1 = obs1[0]
+        assert x1.shape == (3, HIDDEN_DIM)
+        assert torch.allclose(x1, data[:3].cpu(), atol=1e-6)
+
+        obs2 = manager.get_observations(20)
+        assert 0 in obs2
+        x2, r2 = obs2[0]
+        assert x2.shape == (2, HIDDEN_DIM)
+        assert torch.allclose(x2, data[3:5].cpu(), atol=1e-6)
+        assert torch.allclose(r2, (data[3:5] * 2).cpu(), atol=1e-6)
+
+    def test_prefill_offsets_survive_complete_one(self, manager, ictx, device):
+        """Simulate complete_one between prepare and process — offsets use pre-mutation values."""
+        req = InterventionRequest().observe(0)
+        manager.submit(10, req)
+        # Prefill: 4 tokens (input_len=4, cached_len=0)
+        batch = _make_batch([(10, 0, 4, 0)], "prefill", device)
+        manager.prepare_step(batch)
+
+        # Simulate complete_one: mutate cached_len so extend_len would change
+        batch.reqs[0].cached_len = 3  # now extend_len = input_len - cached_len = 1
+
+        # Write data for 4 tokens at layer 0
+        data = torch.randn(4, HIDDEN_DIM, device=device)
+        ictx.x_obs_buffer._buf[:4] = data
+        ictx.residual_obs_buffer._buf[:4] = data
+
+        x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+        res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+        torch.cuda.synchronize()
+
+        manager.process_step(x_cpu, res_cpu, batch)
+        obs = manager.get_observations(10)
+        x_obs, _ = obs[0]
+        # Should get all 4 tokens (pre-mutation), not 1
+        assert x_obs.shape == (4, HIDDEN_DIM)
+        assert torch.allclose(x_obs, data.cpu(), atol=1e-6)
+
+
+# ─── TestConditionalWritePrefillSkip ────────────────────────────────────────
+
+
+@requires_cuda
+class TestConditionalWritePrefillSkip:
+    def test_conditional_write_skipped_in_prefill(self, manager, ictx, device):
+        """Conditional write with prefill batch → no pending patches, no needs_rerun."""
+        fn = lambda x, r: x + r
+        req = InterventionRequest().conditional_write(0, 2, fn)
+        manager.submit(10, req)
+        batch = _make_batch([(10, 0, 3, 0)], "prefill", device)
+        manager.prepare_step(batch)
+
+        # Write known data so observations are extractable
+        known = torch.randn(3, HIDDEN_DIM, device=device)
+        ictx.x_obs_buffer._buf[:3] = known
+        ictx.residual_obs_buffer._buf[:3] = known
+
+        x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+        res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+        torch.cuda.synchronize()
+
+        manager.process_step(x_cpu, res_cpu, batch)
+
+        # Observations should still be extracted (useful for get_observations)
+        obs = manager.get_observations(10)
+        assert 0 in obs
+
+        # But no pending patches or rerun
+        assert not manager.needs_rerun(10)
+        assert len(manager._active[10].pending_patches) == 0
+
+
+# ─── TestConditionalWriteOnce ───────────────────────────────────────────────
+
+
+@requires_cuda
+class TestConditionalWriteOnce:
+    def test_once_true_auto_removes(self, manager, ictx, device):
+        """once=True → op removed after firing, next step has no conditional writes."""
+        fn = lambda x, r: x * 2
+        req = InterventionRequest().conditional_write(0, 2, fn, once=True)
+        manager.submit(10, req)
+        batch = _make_batch([(10, 0, 5, 4)], "decode", device)
+
+        # Step 1: fire the conditional write
+        manager.prepare_step(batch)
+        known = torch.ones(1, HIDDEN_DIM, device=device)
+        ictx.x_obs_buffer._buf[:1] = known
+        ictx.residual_obs_buffer._buf[:1] = known
+        x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+        res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+        torch.cuda.synchronize()
+        manager.process_step(x_cpu, res_cpu, batch)
+
+        assert manager.needs_rerun(10)
+        # Op should be removed from the request
+        assert len(req.conditional_writes) == 0
+
+        # Step 2: apply pending patch
+        manager.prepare_step(batch)
+        assert not manager.needs_rerun(10)
+
+        # Step 3: no more conditional writes → no rerun
+        ictx.x_obs_buffer._buf[:1] = known
+        ictx.residual_obs_buffer._buf[:1] = known
+        x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+        res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+        torch.cuda.synchronize()
+        manager.process_step(x_cpu, res_cpu, batch)
+        assert not manager.needs_rerun(10)
+
+    def test_once_false_persists(self, manager, ictx, device):
+        """once=False → op stays, fires again next step."""
+        call_count = [0]
+
+        def counting_fn(x, r):
+            call_count[0] += 1
+            return x * 2
+
+        req = InterventionRequest().conditional_write(0, 2, counting_fn, once=False)
+        manager.submit(10, req)
+        batch = _make_batch([(10, 0, 5, 4)], "decode", device)
+
+        for step in range(3):
+            manager.prepare_step(batch)
+            known = torch.ones(1, HIDDEN_DIM, device=device)
+            ictx.x_obs_buffer._buf[:1] = known
+            ictx.residual_obs_buffer._buf[:1] = known
+            x_cpu = ictx.x_obs_buffer.copy_to_cpu()
+            res_cpu = ictx.residual_obs_buffer.copy_to_cpu()
+            torch.cuda.synchronize()
+            manager.process_step(x_cpu, res_cpu, batch)
+            assert manager.needs_rerun(10)
+            # Op should persist
+            assert len(req.conditional_writes) == 1
+
+        assert call_count[0] == 3
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

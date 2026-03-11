@@ -180,7 +180,7 @@ class ObserveOp:
 @dataclass
 class WriteOp:
     layer: int
-    kind: str  # "ablate" | "steer" | "patch"
+    kind: Literal["ablate", "steer", "patch"]  # validated in __post_init__
     vector: Tensor | None = None
     alpha: float = 1.0
 
@@ -189,6 +189,7 @@ class ConditionalWriteOp:
     read_layer: int
     write_layer: int
     fn: Callable[[Tensor, Tensor], Tensor]  # fn(x_obs, res_obs) -> activation
+    once: bool = True  # True: fire once then auto-remove; False: per-token (SAE steering)
 
 @dataclass
 class InterventionRequest:
@@ -202,8 +203,12 @@ class InterventionRequest:
     def steer(self, layer: int, vector: Tensor, alpha: float = 1.0) -> Self: ...  # scale=1, add=alpha*v
     def patch(self, layer: int, activation: Tensor) -> Self: ...        # scale=0, add=activation
     def conditional_write(self, read_layer: int, write_layer: int,
-                         fn: Callable[[Tensor, Tensor], Tensor]) -> Self: ...
+                         fn: Callable[[Tensor, Tensor], Tensor],
+                         once: bool = True) -> Self: ...
     # conditional_write auto-adds ObserveOp for read_layer if not present
+    # once=True: fires once then auto-removes (activation patching, diagnostics)
+    # once=False: fires every decode step (SAE steering, adaptive transforms)
+    # Conditional writes are decode-only — skipped during prefill
 ```
 
 No `uid` in `InterventionRequest` — the spec is independent; `manager.submit(uid, request)` binds them.
@@ -226,17 +231,19 @@ class InterventionManager:
     # --- Per-step hooks ---
     def prepare_step(self, batch: Batch) -> None:
         """1. Reset obs buffers, obs_mask, mask_buffer to identity.
-        2. For each req in batch with active intervention:
+        2. Pre-compute token offsets (immune to complete_one mutations).
+        3. For each req in batch with active intervention:
            - Set obs_mask for observed layers + conditional_write read_layers.
            - Apply write ops (ablate/steer/patch) to mask_buffer.
-        3. Apply pending patches from previous conditional writes.
-        4. Clear needs_rerun for uids whose patches are now applied."""
+        4. Apply pending patches from previous conditional writes.
+        5. Clear needs_rerun for uids whose patches are now applied."""
 
     def process_step(self, x_obs_cpu, res_obs_cpu, batch) -> None:
-        """1. Compute per-req token offsets in flat buffer.
+        """1. Use pre-computed token offsets from prepare_step.
         2. Extract layer slices from CPU buffers per observed layer.
-        3. Run conditional_write callbacks: fn(x_obs, res_obs) -> activation.
-        4. Queue resulting patches as pending, mark uid in _needs_rerun."""
+        3. Run conditional_write callbacks (decode only): fn(x_obs, res_obs) -> activation.
+        4. Auto-remove one-shot (once=True) ops after firing.
+        5. Queue resulting patches as pending, mark uid in _needs_rerun."""
 
     # --- Query ---
     def needs_rerun(self, uid: int) -> bool:
@@ -252,11 +259,13 @@ class InterventionManager:
 - `observations: Dict[int, Tuple[Tensor, Tensor]]` (layer → (x_obs, res_obs))
 - `pending_patches: List[Tuple[int, Tensor]]` (write_layer, activation)
 
-Plus: `_needs_rerun: Set[int]` tracking uids whose tokens should not be emitted.
+Plus: `_needs_rerun: Set[int]` tracking uids whose tokens should not be emitted, and `_token_offsets: Dict[int, Tuple[int, int]]` (uid → (start, length)) pre-computed in `prepare_step`.
 
-**ChunkedReq handling**: Import `ChunkedReq` from `minisgl.scheduler.prefill`. Skip in both `prepare_step` and `process_step`.
+**ChunkedReq handling**: Import `ChunkedReq` from `minisgl.scheduler.prefill`. Skip in `prepare_step` (offset computation and intervention application).
 
-**Token offset extraction**: Flat buffer layout is `[L * max_tokens_per_slot + token_offset, hidden_dim]`. For decode: each req = 1 token. For prefill: cumsum of `extend_len`. Real reqs come first in `padded_reqs` (padding appended by `pad_batch`), so iterating `batch.reqs` with cumulative offsets is correct.
+**Token offset pre-computation**: Offsets are computed in `prepare_step` (before `forward_batch` / `complete_one` can mutate `cached_len`/`device_len`), then reused in `process_step`. This prevents the bug where `complete_one()` makes `extend_len` stale for prefill reqs. Flat buffer layout is `[L * max_tokens_per_slot + token_offset, hidden_dim]`. Real reqs come first in `padded_reqs` (padding appended by `pad_batch`), so iterating `batch.reqs` with cumulative offsets is correct.
+
+**Conditional writes are decode-only**: Conditional write callbacks only fire during decode. Prefill observations are still extracted (useful for `get_observations`), but the rerun mechanism is decode-only since prefill processes all tokens at once and can't stall individual positions. One-shot ops (`once=True`) are auto-removed after firing.
 
 **Pending patch ordering**: In `prepare_step`, regular writes are applied first, then pending patches. Conditional patches override static writes at the same `(layer, table_idx)` if there's a conflict.
 

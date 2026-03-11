@@ -6,9 +6,11 @@ No CUDA dependency — pure Python + torch types for serialization.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Literal, Optional
 
 import torch
+
+_WRITE_KINDS = ("ablate", "steer", "patch")
 
 
 @dataclass
@@ -28,9 +30,15 @@ class WriteOp:
     """
 
     layer: int
-    kind: str  # "ablate" | "steer" | "patch"
+    kind: Literal["ablate", "steer", "patch"]
     vector: Optional[torch.Tensor] = None
     alpha: float = 1.0
+
+    def __post_init__(self):
+        if self.kind not in _WRITE_KINDS:
+            raise ValueError(
+                f"Unknown write kind: {self.kind!r}, must be one of {_WRITE_KINDS}"
+            )
 
 
 @dataclass
@@ -38,11 +46,20 @@ class ConditionalWriteOp:
     """Two-pass conditional write: observe at read_layer, then patch at write_layer.
 
     fn(x_obs, res_obs) -> activation tensor to patch at write_layer.
+
+    Note: fn receives CPU tensors in the observation buffer's dtype (default float32).
+    The returned activation is transferred to GPU and cast to the mask buffer's dtype
+    automatically by MaskBuffer.set_patch().
+
+    once: If True (default), the op fires once then auto-removes from the request.
+          If False, it fires every decode step (e.g., per-token SAE steering).
+          Conditional writes are decode-only — they are skipped during prefill.
     """
 
     read_layer: int
     write_layer: int
     fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    once: bool = True
 
 
 @dataclass
@@ -80,12 +97,13 @@ class InterventionRequest:
         read_layer: int,
         write_layer: int,
         fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        once: bool = True,
     ) -> InterventionRequest:
         # Auto-add ObserveOp for read_layer if not already present
         observed_layers = {op.layer for op in self.observations}
         if read_layer not in observed_layers:
             self.observations.append(ObserveOp(layer=read_layer))
         self.conditional_writes.append(
-            ConditionalWriteOp(read_layer=read_layer, write_layer=write_layer, fn=fn)
+            ConditionalWriteOp(read_layer=read_layer, write_layer=write_layer, fn=fn, once=once)
         )
         return self

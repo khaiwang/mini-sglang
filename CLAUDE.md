@@ -116,7 +116,7 @@ The nnsight library (`~/nnsight/`) is the reference for intervention API design.
 | `model.layers[L].output[:] = 0` — ablation | `MaskBuffer.set_ablate(L, table_idx)` (scale=0, add=0) | Yes |
 | `model.layers[L].output += vector` — steering | `MaskBuffer.set_steer(L, table_idx, vector, alpha)` | Yes |
 | `model.layers[L].output = activation` — patching | `MaskBuffer.set_patch(L, table_idx, activation)` (scale=0, add=act) | Yes |
-| Activation patching across prompts (clean→corrupt) | `conditional_write`: observe layer L from req A, patch into req B | Yes |
+| Activation patching across prompts (clean→corrupt) | `observe` on req A + `patch` on req B (user manages cross-request logic, no `conditional_write` needed) | Yes |
 | Multi-request batching with different interventions | `req_map` + per-`(layer, table_idx)` masks — different requests target different layers | Yes |
 | `.input` access (module inputs) | Out of scope — only post-layer residual stream | No |
 | `.grad` / backward pass gradients | Out of scope — inference only | No |
@@ -157,17 +157,24 @@ Key design decisions:
 ```python
 req = InterventionRequest().observe(0).steer(1, vec).ablate(2)
 req = InterventionRequest().conditional_write(read_layer=0, write_layer=2, fn=my_fn)
+req = InterventionRequest().conditional_write(read_layer=5, write_layer=5, fn=sae_fn, once=False)
 # conditional_write auto-adds ObserveOp for read_layer if not present
 ```
 No `uid` in the request — `manager.submit(uid, request)` binds spec to request identity.
 
 **`InterventionManager`** (`intervention/manager.py`): CPU-side orchestration per step:
-- `prepare_step(batch)`: reset buffers/masks → set `obs_mask` + `mask_buffer` for active entries → apply pending patches from conditional writes → clear `_needs_rerun`
-- `process_step(x_obs_cpu, res_obs_cpu, batch)`: extract per-req observations → run conditional write callbacks → queue pending patches
+- `prepare_step(batch)`: reset buffers/masks → pre-compute token offsets (immune to `complete_one` mutations) → set `obs_mask` + `mask_buffer` for active entries → apply pending patches from conditional writes → clear `_needs_rerun`
+- `process_step(x_obs_cpu, res_obs_cpu, batch)`: extract per-req observations → run conditional write callbacks (decode only) → auto-remove one-shot ops → queue pending patches
 - `needs_rerun(uid)` / `get_observations(uid)`: query methods for scheduler
 
-**Conditional write rerun mechanism** — two-pass state machine for `conditional_write(read_layer, write_layer, fn)`:
+**Conditional write rerun mechanism** — two-pass state machine for `conditional_write(read_layer, write_layer, fn, once=True)`:
 1. **Pass 1 (OBSERVING)**: `obs_mask` set for `read_layer`, `write_layer` blend = identity. After forward, `fn(x_obs, res_obs) -> activation`. Activation stored as pending patch. `needs_rerun(uid) = True` → scheduler stalls token emission (reverts `complete_one`, skips `append_host`/`DetokenizeMsg`, request stays in decode batch).
 2. **Pass 2 (PATCHED)**: pending patch applied at `write_layer` via `set_patch()`. `needs_rerun(uid) = False`. Forward re-runs same position with patch active. Scheduler processes normally (emits token).
+
+**`once` flag**: `once=True` (default) auto-removes the op after it fires — safe for one-shot activation patching/diagnostics. `once=False` fires every decode step (e.g., per-token SAE steering); user opts into 2x forward cost.
+
+**Decode-only**: Conditional write callbacks only fire during decode. Prefill observations are still extracted (useful for `get_observations`), but the rerun mechanism is decode-only since prefill processes all tokens at once and can't stall individual positions.
+
+**Cross-prompt patching**: For patching activations from request A into request B (clean→corrupt), use `observe` on req A + `patch` on req B. The user manages cross-request logic externally — no `conditional_write` needed.
 
 Why re-run is correct: since `read_layer < write_layer`, layers 0..write_layer-1 produce identical output in both passes. The patch at `write_layer` only affects layers write_layer..N-1 in pass 2.
