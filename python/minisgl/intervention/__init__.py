@@ -9,7 +9,14 @@ from minisgl.intervention.context import (
     set_intervention_ctx,
 )
 from minisgl.intervention.hooks import unwrap_layers, wrap_layers
+from minisgl.intervention.manager import InterventionManager
 from minisgl.intervention.ops import blend, observe
+from minisgl.intervention.request import (
+    ConditionalWriteOp,
+    InterventionRequest,
+    ObserveOp,
+    WriteOp,
+)
 
 __all__ = [
     "ObservationBuffer",
@@ -22,4 +29,9 @@ __all__ = [
     "blend",
     "wrap_layers",
     "unwrap_layers",
+    "InterventionManager",
+    "InterventionRequest",
+    "ObserveOp",
+    "WriteOp",
+    "ConditionalWriteOp",
 ]

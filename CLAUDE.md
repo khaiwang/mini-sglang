@@ -150,3 +150,24 @@ Key design decisions:
 - **Data-driven, no control flow**: ops execute at every layer; identity masks (`scale=1, add=0, obs_mask=0`) make them no-ops. CUDA graph topology is fixed.
 - **`_`-prefixed buffer attributes** hide from `BaseOP.state_dict()`.
 - **Three-stage async pipeline**: GPU observe → async GPU→CPU copy (bulk) → CPU processing in `_process_last_data()`. `ObservationBuffer.copy_to_cpu()` uses **ping-pong CPU buffers** (two pinned tensors, alternating via XOR flip) so overlap scheduling never corrupts the previous step's observation data.
+
+### Manager + Request API (CPU-side)
+
+**`InterventionRequest`** (`intervention/request.py`): user-facing spec with fluent builder:
+```python
+req = InterventionRequest().observe(0).steer(1, vec).ablate(2)
+req = InterventionRequest().conditional_write(read_layer=0, write_layer=2, fn=my_fn)
+# conditional_write auto-adds ObserveOp for read_layer if not present
+```
+No `uid` in the request — `manager.submit(uid, request)` binds spec to request identity.
+
+**`InterventionManager`** (`intervention/manager.py`): CPU-side orchestration per step:
+- `prepare_step(batch)`: reset buffers/masks → set `obs_mask` + `mask_buffer` for active entries → apply pending patches from conditional writes → clear `_needs_rerun`
+- `process_step(x_obs_cpu, res_obs_cpu, batch)`: extract per-req observations → run conditional write callbacks → queue pending patches
+- `needs_rerun(uid)` / `get_observations(uid)`: query methods for scheduler
+
+**Conditional write rerun mechanism** — two-pass state machine for `conditional_write(read_layer, write_layer, fn)`:
+1. **Pass 1 (OBSERVING)**: `obs_mask` set for `read_layer`, `write_layer` blend = identity. After forward, `fn(x_obs, res_obs) -> activation`. Activation stored as pending patch. `needs_rerun(uid) = True` → scheduler stalls token emission (reverts `complete_one`, skips `append_host`/`DetokenizeMsg`, request stays in decode batch).
+2. **Pass 2 (PATCHED)**: pending patch applied at `write_layer` via `set_patch()`. `needs_rerun(uid) = False`. Forward re-runs same position with patch active. Scheduler processes normally (emits token).
+
+Why re-run is correct: since `read_layer < write_layer`, layers 0..write_layer-1 produce identical output in both passes. The patch at `write_layer` only affects layers write_layer..N-1 in pass 2.

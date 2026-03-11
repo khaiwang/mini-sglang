@@ -170,46 +170,122 @@ def get_intervention_ctx() -> InterventionContext | None:
 def set_intervention_ctx(ctx: InterventionContext) -> None: ...
 ```
 
-### `intervention/manager.py` — CPU-side Async Logic
+### `intervention/request.py` — User-facing API
+
+```python
+@dataclass
+class ObserveOp:
+    layer: int
+
+@dataclass
+class WriteOp:
+    layer: int
+    kind: str  # "ablate" | "steer" | "patch"
+    vector: Tensor | None = None
+    alpha: float = 1.0
+
+@dataclass
+class ConditionalWriteOp:
+    read_layer: int
+    write_layer: int
+    fn: Callable[[Tensor, Tensor], Tensor]  # fn(x_obs, res_obs) -> activation
+
+@dataclass
+class InterventionRequest:
+    observations: List[ObserveOp]
+    writes: List[WriteOp]
+    conditional_writes: List[ConditionalWriteOp]
+
+    # Builder API (fluent chaining, returns self):
+    def observe(self, layer: int) -> Self: ...
+    def ablate(self, layer: int) -> Self: ...                           # scale=0, add=0
+    def steer(self, layer: int, vector: Tensor, alpha: float = 1.0) -> Self: ...  # scale=1, add=alpha*v
+    def patch(self, layer: int, activation: Tensor) -> Self: ...        # scale=0, add=activation
+    def conditional_write(self, read_layer: int, write_layer: int,
+                         fn: Callable[[Tensor, Tensor], Tensor]) -> Self: ...
+    # conditional_write auto-adds ObserveOp for read_layer if not present
+```
+
+No `uid` in `InterventionRequest` — the spec is independent; `manager.submit(uid, request)` binds them.
+
+### `intervention/manager.py` — CPU-side Orchestration
+
+Call sequence per step: `prepare_step(batch)` → GPU forward → `process_step(x_obs_cpu, res_obs_cpu, batch)`.
 
 ```python
 class InterventionManager:
     def __init__(self, ctx: InterventionContext): ...
 
+    # --- Lifecycle ---
     def submit(self, uid: int, request: InterventionRequest) -> None:
-        """Register intervention for a request."""
+        """Register. Raises ValueError on duplicate uid."""
 
     def remove(self, uid: int) -> None:
-        """Cleanup when request finishes."""
+        """Cleanup. No-op if uid not found."""
 
-    def prepare_step(self) -> None:
-        """Called before forward: reset obs_buf, update routes/masks from pending requests."""
+    # --- Per-step hooks ---
+    def prepare_step(self, batch: Batch) -> None:
+        """1. Reset obs buffers, obs_mask, mask_buffer to identity.
+        2. For each req in batch with active intervention:
+           - Set obs_mask for observed layers + conditional_write read_layers.
+           - Apply write ops (ablate/steer/patch) to mask_buffer.
+        3. Apply pending patches from previous conditional writes.
+        4. Clear needs_rerun for uids whose patches are now applied."""
 
-    def process_step(self, obs_cpu: Tensor | None) -> None:
-        """Called after forward (in _process_last_data):
-        1. Dispatch observations to per-request handlers
-        2. Run conditional_write callbacks
-        3. Queue mask updates for next step
-        """
+    def process_step(self, x_obs_cpu, res_obs_cpu, batch) -> None:
+        """1. Compute per-req token offsets in flat buffer.
+        2. Extract layer slices from CPU buffers per observed layer.
+        3. Run conditional_write callbacks: fn(x_obs, res_obs) -> activation.
+        4. Queue resulting patches as pending, mark uid in _needs_rerun."""
+
+    # --- Query ---
+    def needs_rerun(self, uid: int) -> bool:
+        """True if this uid's token should NOT be emitted (stall for conditional write)."""
+
+    def get_observations(self, uid: int) -> Dict[int, Tuple[Tensor, Tensor]]:
+        """Returns {layer: (x_obs_cpu, res_obs_cpu)}. Empty dict if not found."""
 ```
 
-### `intervention/request.py` — User-facing API
+**Internal state**: `_active: Dict[int, _ActiveEntry]` where `_ActiveEntry` holds:
+- `request: InterventionRequest`
+- `table_idx: int | None` (set each step from batch)
+- `observations: Dict[int, Tuple[Tensor, Tensor]]` (layer → (x_obs, res_obs))
+- `pending_patches: List[Tuple[int, Tensor]]` (write_layer, activation)
 
-```python
-@dataclass
-class InterventionRequest:
-    uid: int
-    observations: List[ObserveOp]
-    writes: List[WriteOp]
-    conditional_writes: List[ConditionalWriteOp]
+Plus: `_needs_rerun: Set[int]` tracking uids whose tokens should not be emitted.
 
-    def observe(self, layer: int, positions: slice | list[int] | None = None) -> Self: ...
-    def ablate(self, layer: int) -> Self: ...                           # scale=0, add=0
-    def steer(self, layer: int, vector: Tensor, alpha: float = 1.0) -> Self: ...  # scale=1, add=alpha*v
-    def patch(self, layer: int, activation: Tensor) -> Self: ...        # scale=0, add=activation
-    def conditional_write(self, read_layer: int, write_layer: int,
-                         fn: Callable[[Tensor], Tuple[Tensor, Tensor]]) -> Self: ...
+**ChunkedReq handling**: Import `ChunkedReq` from `minisgl.scheduler.prefill`. Skip in both `prepare_step` and `process_step`.
+
+**Token offset extraction**: Flat buffer layout is `[L * max_tokens_per_slot + token_offset, hidden_dim]`. For decode: each req = 1 token. For prefill: cumsum of `extend_len`. Real reqs come first in `padded_reqs` (padding appended by `pad_batch`), so iterating `batch.reqs` with cumulative offsets is correct.
+
+**Pending patch ordering**: In `prepare_step`, regular writes are applied first, then pending patches. Conditional patches override static writes at the same `(layer, table_idx)` if there's a conflict.
+
+#### Conditional Write Rerun Mechanism
+
+Each request with conditional writes follows a two-pass state machine:
+
 ```
+Pass 1 (OBSERVING):
+  prepare_step: set obs_mask for read_layer. mask_buffer at write_layer = identity.
+  Forward: observe captures read_layer activation. write_layer blend = identity (no-op).
+  process_step: fn(x_obs, res_obs) -> activation. Store as pending patch.
+                Mark uid in _needs_rerun.
+  Scheduler (Step 6): sees needs_rerun(uid) = True
+    → reverts complete_one (device_len -= 1, cached_len -= 1)
+    → skips append_host and DetokenizeMsg
+    → request stays in decode batch
+
+Pass 2 (PATCHED):
+  prepare_step: apply pending patch at write_layer via set_patch().
+                Clear uid from _needs_rerun.
+  Forward: re-runs same position T. write_layer blend applies patch.
+           KV cache at position T is re-computed (correct: layers before write_layer
+           produce identical KV, layers at/after produce updated KV).
+  process_step: no pending conditional writes → normal.
+  Scheduler: needs_rerun(uid) = False → process normally (emit token).
+```
+
+**Why re-run is correct**: Since `read_layer < write_layer`, layers 0..write_layer-1 produce identical output in both passes (same input token, same blend=identity). The observation at `read_layer` is the same in both passes. The patch at `write_layer` only affects layers write_layer..N-1 in pass 2, giving the correct result as if the patch were applied mid-forward.
 
 ## Integration Points
 
@@ -266,7 +342,11 @@ python/minisgl/intervention/
 tests/intervention/
 ├── test_buffers.py      # ObservationBuffer (shapes, offsets, write/read, copy_to_cpu), MaskBuffer
 ├── test_ops.py          # observe (unified), blend (split), end-to-end observe+blend
+├── test_hooks.py        # wrap_layers/unwrap_layers, identity pass-through, observe+blend in wrapped forward
 ├── test_req_map.py      # req_map plumbing: prefill packing, decode identity, graph buffer
+├── test_engine_integration.py  # EngineConfig field, ForwardOutput fields, CLI flag
+├── test_request.py      # InterventionRequest builder API, dataclass fields (pure Python, no CUDA)
+├── test_manager.py      # InterventionManager lifecycle, prepare/process, conditional write rerun
 └── test_e2e.py          # End-to-end with real model (spawn scheduler subprocess)
 
 benchmark/intervention/
@@ -321,17 +401,19 @@ Built and tested in isolation with mock tensors (no model, no engine):
 - Added `--enable-intervention` CLI flag to `server/args.py`
 - Tests: config field, ForwardOutput fields, backward compat, CLI flag parsing
 
-### Step 5: Manager + Request API
+### Step 5: Manager + Request API — DONE
 
-**Files:** `intervention/manager.py`, `intervention/request.py`
+**Files:** `intervention/request.py`, `intervention/manager.py`, `intervention/__init__.py`, `tests/intervention/test_request.py`, `tests/intervention/test_manager.py`
 
-- `InterventionRequest`: builder API for `observe()`, `ablate()`, `steer()`, `patch()`, `conditional_write()`
+- `InterventionRequest`: builder API with fluent chaining for `observe()`, `ablate()`, `steer()`, `patch()`, `conditional_write()`. No `uid` — spec is independent, `manager.submit(uid, req)` binds them. `conditional_write` auto-adds `ObserveOp` for `read_layer`.
 - `InterventionManager`:
-  - `submit(uid, request)`: register, translate request into buffer updates
-  - `remove(uid)`: cleanup masks/routes for finished request
-  - `prepare_step()`: reset obs_buf, apply pending mask updates
-  - `process_step(obs_cpu)`: dispatch observations to handlers, run conditional callbacks
-- Test with mock forward passes (no real model)
+  - `submit(uid, request)` / `remove(uid)`: lifecycle management
+  - `prepare_step(batch)`: reset all buffers/masks to identity, set `obs_mask` and `mask_buffer` from active entries in batch, apply pending conditional write patches, clear `_needs_rerun`
+  - `process_step(x_obs_cpu, res_obs_cpu, batch)`: extract per-req observations from flat CPU buffers using token offsets, run conditional write callbacks, queue resulting patches
+  - `needs_rerun(uid)` / `get_observations(uid)`: query methods for scheduler integration
+- ChunkedReq filtering in both prepare and process paths
+- Two-pass conditional write rerun mechanism: observe pass → compute patch → apply pass
+- 14 pure-Python tests (request API), 27 CUDA tests (manager lifecycle, resets, mask setting, observation extraction, conditional write full cycle)
 
 ### Step 6: Scheduler Integration
 
